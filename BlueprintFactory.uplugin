@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "Blueprint Factory",
+	"Version": 1,
+	"VersionName": "1.0",
+	"Description": "JSON 模板驱动的蓝图/材质/地形批量生成工具",
+	"Category": "Editor",
+	"CreatedBy": "jone7",
+	"EnabledByDefault": true,
+	"CanContainContent": true,
+	"Modules": [
+		{
+			"Name": "BlueprintFactory",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		}
+	]
+}
