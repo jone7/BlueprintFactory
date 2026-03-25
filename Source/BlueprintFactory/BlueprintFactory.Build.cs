@@ -21,6 +21,8 @@ public class BlueprintFactory : ModuleRules
 			"DesktopPlatform",
 			"Json",
 			"JsonUtilities",
+			"Landscape",
+			"LandscapeEditor",
 		});
 	}
 }

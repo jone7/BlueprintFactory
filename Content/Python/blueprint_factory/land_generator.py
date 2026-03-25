@@ -1,23 +1,26 @@
 """BlueprintFactory - 地形生成器
-从 JSON 模板 + 高度图导入 Landscape。
+从 JSON 模板创建真正的 UE Landscape。
+通过 C++ BPFactoryBlueprintLibrary.CreateLandscape 创建。
 
 JSON 模板格式:
 {
-    "Heightmap": "Config/LandscapeTemplates/heightmap_main.png",
-    "Size": {"X": 200, "Y": 200},
-    "Scale": {"X": 200, "Y": 200, "Z": 100},
+    "Size": {"X": 127, "Y": 127},
+    "Scale": {"X": 100, "Y": 100, "Z": 100},
     "Location": {"X": 0, "Y": 0, "Z": 0},
+    "HeightData": "flat",
     "Layers": [
-        {
-            "Name": "Farm",
-            "Material": "/Game/Art/Materials/Landscape/MI_Ground_Farm",
-            "Region": {"MinX": 50, "MaxX": 100, "MinY": 50, "MaxY": 100}
-        }
+        {"Name": "Grass", "Material": "/Game/Art/Materials/MI_Ground_Farm"}
     ]
 }
+
+HeightData 可以是:
+- "flat" — 平坦地形
+- "file:path/to/heightmap.raw" — 从 RAW 文件读取（uint16 数组）
+- [32768, 32768, ...] — 直接内嵌数组
 """
 import json
 import os
+import struct
 
 try:
     import unreal
@@ -41,7 +44,7 @@ def _log_error(msg):
 
 
 def generate_landscape(json_path: str):
-    """从 JSON 模板导入地形"""
+    """从 JSON 模板生成地形"""
     if not os.path.isfile(json_path):
         _log_error(f"JSON 文件不存在: {json_path}")
         return False
@@ -49,73 +52,125 @@ def generate_landscape(json_path: str):
     with open(json_path, "r", encoding="utf-8") as f:
         template = json.load(f)
 
-    heightmap_path = template.get("Heightmap", "")
     size = template.get("Size", {"X": 127, "Y": 127})
     scale = template.get("Scale", {"X": 100, "Y": 100, "Z": 100})
     location = template.get("Location", {"X": 0, "Y": 0, "Z": 0})
+    height_data_spec = template.get("HeightData", "flat")
     layers = template.get("Layers", [])
 
-    # 高度图路径相对于 JSON 文件所在目录
-    if heightmap_path and not os.path.isabs(heightmap_path):
-        json_dir = os.path.dirname(json_path)
-        heightmap_path = os.path.join(json_dir, heightmap_path)
+    size_x = int(size["X"])
+    size_y = int(size["Y"])
 
     if not IN_UE:
-        _log(f"非 UE 环境，跳过地形生成")
-        _log(f"  高度图: {heightmap_path}")
-        _log(f"  尺寸: {size['X']}x{size['Y']}")
-        _log(f"  缩放: {scale}")
-        _log(f"  层数: {len(layers)}")
+        _log(f"非 UE 环境，跳过地形生成: {size_x}x{size_y}")
         return False
 
-    _log(f"导入地形: {size['X']}x{size['Y']}")
+    _log(f"生成地形: {size_x}x{size_y}, 缩放=({scale['X']},{scale['Y']},{scale['Z']})")
 
-    # 检查高度图
-    if heightmap_path and os.path.isfile(heightmap_path):
-        _log(f"  高度图: {heightmap_path}")
-        _import_with_heightmap(heightmap_path, size, scale, location, layers)
-    else:
-        _log(f"  无高度图，创建平坦地形")
-        _create_flat_landscape(size, scale, location, layers)
+    # 准备高度数据
+    height_array = _prepare_height_data(height_data_spec, size_x, size_y, json_path)
+
+    # 调用 C++ 创建 Landscape
+    loc = unreal.Vector(location["X"], location["Y"], location["Z"])
+
+    bplib = unreal.BPFactoryBlueprintLibrary
+    landscape = bplib.create_landscape(
+        unreal.EditorLevelLibrary.get_editor_world(),
+        loc,
+        size_x, size_y,
+        float(scale["X"]), float(scale["Y"]), float(scale["Z"]),
+        height_array
+    )
+
+    if not landscape:
+        _log_error("Landscape 创建失败")
+        return False
+
+    _log(f"Landscape 创建成功")
+
+    # 设置材质层（如果有）
+    for layer in layers:
+        mat_path = layer.get("Material", "")
+        if mat_path:
+            _log(f"  层: {layer.get('Name', '?')} → {mat_path}")
+            # 材质层设置需要 LandscapeMaterialInterface，后续完善
 
     return True
 
 
-def _import_with_heightmap(heightmap_path, size, scale, location, layers):
-    """从高度图导入地形"""
-    # UE 的 Landscape 导入需要通过编辑器工具
-    # 使用 LandscapeEditorUtils 或 EditorLevelLibrary
-    _log("  高度图导入功能待完善（需要 LandscapeEditorUtils API）")
-    _log("  临时方案：请在编辑器中手动导入高度图，然后用本工具刷材质层")
+def _prepare_height_data(spec, size_x, size_y, json_path):
+    """准备高度数据数组"""
+    total = size_x * size_y
 
-    # 记录层信息供后续使用
-    for layer in layers:
-        _log(f"  层: {layer['Name']} → {layer.get('Material', 'default')}")
+    if spec == "flat":
+        # 平坦地形，中间高度
+        return [32768] * total
+
+    if isinstance(spec, str) and spec.startswith("file:"):
+        # 从 RAW 文件读取
+        file_path = spec[5:]
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(os.path.dirname(json_path), file_path)
+
+        if os.path.isfile(file_path):
+            with open(file_path, "rb") as f:
+                raw = f.read()
+            count = len(raw) // 2
+            heights = list(struct.unpack(f"<{count}H", raw[:count * 2]))
+            if len(heights) >= total:
+                return heights[:total]
+            else:
+                _log(f"  高度图数据不足: {len(heights)} < {total}，补齐为平坦")
+                heights.extend([32768] * (total - len(heights)))
+                return heights
+        else:
+            _log(f"  高度图文件不存在: {file_path}，使用平坦")
+            return [32768] * total
+
+    if isinstance(spec, list):
+        # 直接内嵌数组
+        if len(spec) >= total:
+            return [int(v) for v in spec[:total]]
+        else:
+            data = [int(v) for v in spec]
+            data.extend([32768] * (total - len(data)))
+            return data
+
+    # 默认平坦
+    return [32768] * total
 
 
-def _create_flat_landscape(size, scale, location, layers):
-    """创建平坦地形（无高度图时的回退方案）"""
-    _log("  创建平坦地形...")
+def export_landscape(json_path: str):
+    """导出当前关卡中的 Landscape 为 JSON（基本信息）"""
+    if not IN_UE:
+        _log("非 UE 环境，无法导出")
+        return False
 
-    # 使用 EditorLevelLibrary 在场景中生成 Landscape
-    # 注意：UE Python API 对 Landscape 的支持有限
-    # 最可靠的方式是通过 EditorLevelLibrary.spawn_actor_from_class
-    try:
-        loc = unreal.Vector(location["X"], location["Y"], location["Z"])
-        rot = unreal.Rotator(0, 0, 0)
-        sc = unreal.Vector(scale["X"], scale["Y"], scale["Z"])
+    actors = unreal.EditorLevelLibrary.get_all_level_actors()
+    landscape = None
+    for actor in actors:
+        if isinstance(actor, unreal.LandscapeProxy):
+            landscape = actor
+            break
 
-        _log(f"  位置: {loc}")
-        _log(f"  缩放: {sc}")
-        _log(f"  地形创建需要在编辑器中完成（Python API 限制）")
-        _log(f"  建议：编辑器 → Landscape 工具 → 新建 → 设置尺寸 {size['X']}x{size['Y']}")
+    if not landscape:
+        _log_error("当前关卡中没有 Landscape")
+        return False
 
-        # 输出层配置供手动参考
-        for layer in layers:
-            region = layer.get("Region", {})
-            _log(f"  层 '{layer['Name']}': 材质={layer.get('Material', 'default')}, "
-                 f"区域=({region.get('MinX', 0)},{region.get('MinY', 0)})-"
-                 f"({region.get('MaxX', 0)},{region.get('MaxY', 0)})")
+    loc = landscape.get_actor_location()
+    scale = landscape.get_actor_scale3d()
 
-    except Exception as e:
-        _log_error(f"  地形创建失败: {e}")
+    template = {
+        "Size": {"X": 127, "Y": 127},
+        "Scale": {"X": round(scale.x, 2), "Y": round(scale.y, 2), "Z": round(scale.z, 2)},
+        "Location": {"X": round(loc.x, 1), "Y": round(loc.y, 1), "Z": round(loc.z, 1)},
+        "HeightData": "flat",
+        "Layers": [],
+    }
+
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(template, f, indent=2, ensure_ascii=False)
+
+    _log(f"Landscape 导出完成: {json_path}")
+    return True
