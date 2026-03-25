@@ -29,6 +29,67 @@ void SBlueprintFactoryPanel::Construct(const FArguments& InArgs)
 				SNew(SSeparator)
 			]
 
+			// ===== 关卡生成 =====
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 8, 0, 4)
+			[
+				SNew(STextBlock)
+				.Text(LOCTEXT("LevelTitle", "关卡生成"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 14))
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SNew(STextBlock).Text(LOCTEXT("LevelJson", "JSON:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(LevelJsonPath, SEditableTextBox)
+					.HintText(LOCTEXT("LevelHint", "LevelTemplates/*.json"))
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(4, 0, 0, 0)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("BrowseLevel", "浏览..."))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnBrowseLevelJson)
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("GenLevel", "生成关卡"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnGenerateLevel)
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("ExportLevel", "导出当前关卡"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnExportLevel)
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SNew(STextBlock).Text(LOCTEXT("ExportLevelTo", "导出到:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(1.f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(ExportLevelPath, SEditableTextBox)
+					.HintText(LOCTEXT("ExportLevelHint", "导出 JSON 路径"))
+				]
+			]
+
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 4)
+			[
+				SNew(SSeparator)
+			]
+
 			// ===== 蓝图生成 =====
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 8, 0, 4)
 			[
@@ -57,9 +118,41 @@ void SBlueprintFactoryPanel::Construct(const FArguments& InArgs)
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
 			[
-				SNew(SButton)
-				.Text(LOCTEXT("GenBP", "生成蓝图"))
-				.OnClicked(this, &SBlueprintFactoryPanel::OnGenerateBlueprint)
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("GenBP", "生成蓝图"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnGenerateBlueprint)
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("ExportBP", "导出蓝图→JSON"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnExportBlueprint)
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SNew(STextBlock).Text(LOCTEXT("BPAsset", "蓝图资产:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(0.5f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(ExportBPAssetPath, SEditableTextBox)
+					.HintText(LOCTEXT("BPAssetHint", "/Game/Blueprints/BP_XXX"))
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 0, 0)
+				[
+					SNew(STextBlock).Text(LOCTEXT("BPExportTo", "导出到:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(0.5f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(ExportBPJsonPath, SEditableTextBox)
+					.HintText(LOCTEXT("BPExportHint", "导出 JSON 路径"))
+				]
 			]
 
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 4)
@@ -95,9 +188,41 @@ void SBlueprintFactoryPanel::Construct(const FArguments& InArgs)
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
 			[
-				SNew(SButton)
-				.Text(LOCTEXT("GenMat", "生成材质"))
-				.OnClicked(this, &SBlueprintFactoryPanel::OnGenerateMaterial)
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("GenMat", "生成材质"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnGenerateMaterial)
+				]
+				+ SHorizontalBox::Slot().AutoWidth().Padding(8, 0, 0, 0)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("ExportMat", "导出材质→JSON"))
+					.OnClicked(this, &SBlueprintFactoryPanel::OnExportMaterial)
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0, 4, 0, 0)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SNew(STextBlock).Text(LOCTEXT("MatAsset", "材质资产:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(0.5f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(ExportMatAssetPath, SEditableTextBox)
+					.HintText(LOCTEXT("MatAssetHint", "/Game/Art/Materials/MI_XXX"))
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(8, 0, 0, 0)
+				[
+					SNew(STextBlock).Text(LOCTEXT("MatExportTo", "导出到:"))
+				]
+				+ SHorizontalBox::Slot().FillWidth(0.5f).Padding(8, 0, 0, 0)
+				[
+					SAssignNew(ExportMatJsonPath, SEditableTextBox)
+					.HintText(LOCTEXT("MatExportHint", "导出 JSON 路径"))
+				]
 			]
 
 			+ SVerticalBox::Slot().AutoHeight().Padding(0, 12, 0, 4)
@@ -175,6 +300,20 @@ void SBlueprintFactoryPanel::UpdateStatus(const FString& Text)
 
 // ===== 浏览按钮 =====
 
+FReply SBlueprintFactoryPanel::OnBrowseLevelJson()
+{
+	IDesktopPlatform* Desktop = FDesktopPlatformModule::Get();
+	if (!Desktop) return FReply::Handled();
+	TArray<FString> Files;
+	if (Desktop->OpenFileDialog(GetParentWindow(), TEXT("选择关卡模板"), TEXT(""), TEXT(""),
+		TEXT("JSON (*.json)|*.json"), 0, Files))
+	{
+		if (Files.Num() > 0 && LevelJsonPath.IsValid())
+			LevelJsonPath->SetText(FText::FromString(Files[0]));
+	}
+	return FReply::Handled();
+}
+
 FReply SBlueprintFactoryPanel::OnBrowseBlueprintJson()
 {
 	IDesktopPlatform* Desktop = FDesktopPlatformModule::Get();
@@ -219,6 +358,30 @@ FReply SBlueprintFactoryPanel::OnBrowseLandscapeJson()
 
 // ===== 生成按钮 =====
 
+FReply SBlueprintFactoryPanel::OnGenerateLevel()
+{
+	FString JsonPath = LevelJsonPath.IsValid() ? LevelJsonPath->GetText().ToString() : TEXT("");
+	if (JsonPath.IsEmpty()) { UpdateStatus(TEXT("请先选择关卡 JSON 模板")); return FReply::Handled(); }
+	JsonPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	FString Py = FString::Printf(TEXT("from blueprint_factory.level_generator import generate_level; generate_level(r'%s')"), *JsonPath);
+	UpdateStatus(TEXT("生成关卡中..."));
+	RunPython(Py);
+	UpdateStatus(TEXT("关卡生成完成"));
+	return FReply::Handled();
+}
+
+FReply SBlueprintFactoryPanel::OnExportLevel()
+{
+	FString OutPath = ExportLevelPath.IsValid() ? ExportLevelPath->GetText().ToString() : TEXT("");
+	if (OutPath.IsEmpty()) { UpdateStatus(TEXT("请填写导出 JSON 路径")); return FReply::Handled(); }
+	OutPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	FString Py = FString::Printf(TEXT("from blueprint_factory.level_generator import export_level; export_level(r'%s')"), *OutPath);
+	UpdateStatus(TEXT("导出关卡中..."));
+	RunPython(Py);
+	UpdateStatus(TEXT("关卡导出完成"));
+	return FReply::Handled();
+}
+
 FReply SBlueprintFactoryPanel::OnGenerateBlueprint()
 {
 	FString JsonPath = BlueprintJsonPath.IsValid() ? BlueprintJsonPath->GetText().ToString() : TEXT("");
@@ -237,6 +400,20 @@ FReply SBlueprintFactoryPanel::OnGenerateBlueprint()
 	return FReply::Handled();
 }
 
+FReply SBlueprintFactoryPanel::OnExportBlueprint()
+{
+	FString AssetPath = ExportBPAssetPath.IsValid() ? ExportBPAssetPath->GetText().ToString() : TEXT("");
+	FString OutPath = ExportBPJsonPath.IsValid() ? ExportBPJsonPath->GetText().ToString() : TEXT("");
+	if (AssetPath.IsEmpty() || OutPath.IsEmpty()) { UpdateStatus(TEXT("请填写蓝图资产路径和导出 JSON 路径")); return FReply::Handled(); }
+	AssetPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	OutPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	FString Py = FString::Printf(TEXT("from blueprint_factory.bp_generator import export_blueprint; export_blueprint(r'%s', r'%s')"), *AssetPath, *OutPath);
+	UpdateStatus(TEXT("导出蓝图中..."));
+	RunPython(Py);
+	UpdateStatus(TEXT("蓝图导出完成"));
+	return FReply::Handled();
+}
+
 FReply SBlueprintFactoryPanel::OnGenerateMaterial()
 {
 	FString JsonPath = MaterialJsonPath.IsValid() ? MaterialJsonPath->GetText().ToString() : TEXT("");
@@ -252,6 +429,20 @@ FReply SBlueprintFactoryPanel::OnGenerateMaterial()
 	UpdateStatus(TEXT("生成材质中..."));
 	RunPython(Py);
 	UpdateStatus(TEXT("材质生成完成"));
+	return FReply::Handled();
+}
+
+FReply SBlueprintFactoryPanel::OnExportMaterial()
+{
+	FString AssetPath = ExportMatAssetPath.IsValid() ? ExportMatAssetPath->GetText().ToString() : TEXT("");
+	FString OutPath = ExportMatJsonPath.IsValid() ? ExportMatJsonPath->GetText().ToString() : TEXT("");
+	if (AssetPath.IsEmpty() || OutPath.IsEmpty()) { UpdateStatus(TEXT("请填写材质资产路径和导出 JSON 路径")); return FReply::Handled(); }
+	AssetPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	OutPath.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+	FString Py = FString::Printf(TEXT("from blueprint_factory.mat_generator import export_material; export_material(r'%s', r'%s')"), *AssetPath, *OutPath);
+	UpdateStatus(TEXT("导出材质中..."));
+	RunPython(Py);
+	UpdateStatus(TEXT("材质导出完成"));
 	return FReply::Handled();
 }
 

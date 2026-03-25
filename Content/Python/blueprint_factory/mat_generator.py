@@ -103,3 +103,64 @@ def generate_material(json_path: str):
     unreal.EditorAssetLibrary.save_asset(asset_path)
     _log(f"材质生成完成: {asset_path}")
     return True
+
+
+# ===================================================================
+# 反向导出：Material Instance → JSON 模板
+# ===================================================================
+
+def export_material(asset_path: str, json_path: str):
+    """将已有材质实例导出为 JSON 模板"""
+    if not IN_UE:
+        _log("非 UE 环境，无法导出")
+        return False
+
+    mi = unreal.load_asset(asset_path)
+    if not mi:
+        _log_error(f"无法加载材质: {asset_path}")
+        return False
+
+    _log(f"导出材质: {asset_path}")
+
+    template = {
+        "Name": mi.get_name(),
+        "Parent": "",
+        "OutputPath": str(asset_path).rsplit("/", 1)[0] + "/",
+        "Textures": {},
+        "Parameters": {},
+    }
+
+    # 父材质
+    parent = mi.get_editor_property("Parent")
+    if parent:
+        template["Parent"] = parent.get_path_name()
+
+    # 纹理参数
+    mel = unreal.MaterialEditingLibrary
+    tex_params = mel.get_texture_parameter_names(mi)
+    for param_name in tex_params:
+        tex = mel.get_material_instance_texture_parameter_value(mi, param_name)
+        if tex:
+            template["Textures"][str(param_name)] = tex.get_path_name()
+
+    # 标量参数
+    scalar_params = mel.get_scalar_parameter_names(mi)
+    for param_name in scalar_params:
+        val = mel.get_material_instance_scalar_parameter_value(mi, param_name)
+        template["Parameters"][str(param_name)] = round(val, 4)
+
+    # 向量参数
+    vector_params = mel.get_vector_parameter_names(mi)
+    for param_name in vector_params:
+        val = mel.get_material_instance_vector_parameter_value(mi, param_name)
+        template["Parameters"][str(param_name)] = [
+            round(val.r, 4), round(val.g, 4), round(val.b, 4), round(val.a, 4)
+        ]
+
+    # 写入 JSON
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(template, f, indent=2, ensure_ascii=False)
+
+    _log(f"材质导出完成: {json_path}")
+    return True

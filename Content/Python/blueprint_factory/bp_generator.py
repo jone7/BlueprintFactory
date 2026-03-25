@@ -175,3 +175,77 @@ def _set_unlua_binding(bp, module_name):
         _log(f"  UnLua 绑定: {module_name}（需手动在蓝图中设置 UnLuaInterface）")
     except Exception as e:
         _log(f"  UnLua 绑定设置失败: {e}")
+
+
+# ===================================================================
+# 反向导出：Blueprint → JSON 模板
+# ===================================================================
+
+def export_blueprint(asset_path: str, json_path: str):
+    """将已有蓝图导出为 JSON 模板"""
+    if not IN_UE:
+        _log("非 UE 环境，无法导出")
+        return False
+
+    bp = unreal.load_asset(asset_path)
+    if not bp:
+        _log_error(f"无法加载蓝图: {asset_path}")
+        return False
+
+    _log(f"导出蓝图: {asset_path}")
+
+    template = {
+        "Name": bp.get_name(),
+        "ParentClass": "",
+        "OutputPath": str(asset_path).rsplit("/", 1)[0] + "/",
+        "Components": [],
+        "UnLuaBinding": "",
+    }
+
+    # 父类
+    parent = bp.get_editor_property("ParentClass")
+    if parent:
+        parent_path = parent.get_path_name()
+        # 反查简写
+        for short, full in PARENT_CLASS_MAP.items():
+            if full in parent_path:
+                parent_path = short
+                break
+        template["ParentClass"] = parent_path
+
+    # 组件
+    scs = bp.get_editor_property("SimpleConstructionScript")
+    if scs:
+        nodes = scs.get_all_nodes()
+        for node in nodes:
+            comp = node.get_editor_property("ComponentTemplate")
+            if comp:
+                comp_data = {
+                    "Type": comp.get_class().get_name().replace("Component", ""),
+                    "Name": comp.get_name(),
+                }
+
+                # StaticMesh
+                if isinstance(comp, unreal.StaticMeshComponent):
+                    mesh = comp.get_editor_property("StaticMesh")
+                    if mesh:
+                        comp_data["Mesh"] = mesh.get_path_name()
+
+                # BoxComponent
+                if isinstance(comp, unreal.BoxComponent):
+                    ext = comp.get_editor_property("BoxExtent")
+                    comp_data["Extent"] = [ext.x, ext.y, ext.z]
+
+                # SphereComponent
+                if isinstance(comp, unreal.SphereComponent):
+                    comp_data["Radius"] = comp.get_editor_property("SphereRadius")
+
+                template["Components"].append(comp_data)
+
+    # 写入 JSON
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(template, f, indent=2, ensure_ascii=False)
+
+    _log(f"蓝图导出完成: {json_path} ({len(template['Components'])} 个组件)")
+    return True
