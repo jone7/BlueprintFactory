@@ -148,8 +148,8 @@ def _generate_master_material(template):
 
     # 创建节点
     node_map = {}  # name → expression
-    for node_data in nodes:
-        expr = _create_node(mat, node_data)
+    for idx, node_data in enumerate(nodes):
+        expr = _create_node(mat, node_data, idx)
         if expr:
             node_name = node_data.get("Name", "")
             node_map[node_name] = expr
@@ -195,7 +195,7 @@ def _apply_material_properties(mat, properties):
         mat.set_editor_property("ShadingModel", shading_map[shading])
 
 
-def _create_node(mat, node_data):
+def _create_node(mat, node_data, index=0):
     """创建材质节点"""
     node_type = node_data.get("Type", "")
     node_name = node_data.get("Name", "")
@@ -206,12 +206,18 @@ def _create_node(mat, node_data):
         return None
 
     mel = unreal.MaterialEditingLibrary
-    expr = mel.create_material_expression(mat, getattr(unreal, ue_class, None) or unreal.load_class(None, f"/Script/Engine.{ue_class}"), -300, 0)
+
+    # 按索引排列：每行 3 个节点，间距 250
+    col = index % 3
+    row = index // 3
+    pos_x = -400 - col * 250
+    pos_y = -200 + row * 200
+
+    expr = mel.create_material_expression(mat, getattr(unreal, ue_class, None) or unreal.load_class(None, f"/Script/Engine.{ue_class}"), pos_x, pos_y)
 
     if not expr:
-        # 回退：用字符串方式创建
         try:
-            expr = mel.create_material_expression(mat, unreal.load_class(None, f"/Script/Engine.{ue_class}"), -300, 0)
+            expr = mel.create_material_expression(mat, unreal.load_class(None, f"/Script/Engine.{ue_class}"), pos_x, pos_y)
         except Exception:
             _log(f"  创建节点失败: {node_name} ({node_type})")
             return None
@@ -285,14 +291,27 @@ def _connect_nodes(mat, mel, node_map, conn):
             _log(f"  连线失败: 找不到源节点 {from_node_name}")
             return
 
-        # 确定输出引脚索引
-        output_index = _get_output_index(from_pin)
+        # from_pin: 源节点的输出引脚名（如 "RGB", "" 等）
+        # to_pin: 材质属性名（如 "BaseColor", "Roughness" 等）
+        mat_prop = _get_material_property(to_pin)
 
         try:
-            mel.connect_material_property(from_expr, to_pin, _get_material_property(to_pin))
-            _log(f"  连线: {from_str} → {to_str}")
+            # connect_material_property(from_expression, output_name, property)
+            # output_name 对于单输出节点用空字符串
+            result = mel.connect_material_property(from_expr, from_pin if from_pin else "", mat_prop)
+            if result:
+                _log(f"  连线成功: {from_str} → Material.{to_pin}")
+            else:
+                _log(f"  连线返回 False: {from_str} → Material.{to_pin} (prop={mat_prop})")
         except Exception as e:
-            _log(f"  连线失败: {from_str} → {to_str}: {e}")
+            _log(f"  连线异常: {from_str} → Material.{to_pin}: {e}")
+            # 尝试不带 output_name
+            try:
+                result = mel.connect_material_property(from_expr, "", mat_prop)
+                if result:
+                    _log(f"  连线成功(空pin): {from_str} → Material.{to_pin}")
+            except Exception as e2:
+                _log(f"  连线再次失败: {e2}")
         return
 
     # 节点之间连接
