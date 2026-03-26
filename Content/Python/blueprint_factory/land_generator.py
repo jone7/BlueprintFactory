@@ -72,15 +72,27 @@ def generate_landscape(json_path: str):
 
     # 调用 C++ 创建 Landscape
     loc = unreal.Vector(location["X"], location["Y"], location["Z"])
-
     bplib = unreal.BPFactoryBlueprintLibrary
-    landscape = bplib.create_landscape(
-        unreal.EditorLevelLibrary.get_editor_world(),
-        loc,
-        size_x, size_y,
-        float(scale["X"]), float(scale["Y"]), float(scale["Z"]),
-        height_array
-    )
+    world = unreal.EditorLevelLibrary.get_editor_world()
+
+    if isinstance(height_data_spec, str) and height_data_spec.startswith("file:"):
+        # 从 RAW 文件创建
+        file_path = height_data_spec[5:]
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(os.path.dirname(json_path), file_path)
+        _log(f"  使用高度图文件: {file_path}")
+        landscape = bplib.create_landscape_from_file(
+            world, loc,
+            size_x, size_y,
+            float(scale["X"]), float(scale["Y"]), float(scale["Z"]),
+            file_path)
+    else:
+        # 平坦地形
+        _log(f"  使用平坦地形")
+        landscape = bplib.create_flat_landscape(
+            world, loc,
+            size_x, size_y,
+            float(scale["X"]), float(scale["Y"]), float(scale["Z"]))
 
     if not landscape:
         _log_error("Landscape 创建失败")
