@@ -92,33 +92,18 @@ MATERIAL_OUTPUTS = {
 }
 
 # 节点类型 → UE Expression 类名
-NODE_TYPE_MAP = {
-    "TextureSample": "MaterialExpressionTextureSample",
-    "TextureCoordinate": "MaterialExpressionTextureCoordinate",
-    "Constant": "MaterialExpressionConstant",
-    "Constant2Vector": "MaterialExpressionConstant2Vector",
-    "Constant3Vector": "MaterialExpressionConstant3Vector",
-    "Constant4Vector": "MaterialExpressionConstant4Vector",
-    "Multiply": "MaterialExpressionMultiply",
-    "Add": "MaterialExpressionAdd",
-    "Subtract": "MaterialExpressionSubtract",
-    "Divide": "MaterialExpressionDivide",
-    "Lerp": "MaterialExpressionLinearInterpolate",
-    "Power": "MaterialExpressionPower",
-    "Clamp": "MaterialExpressionClamp",
-    "OneMinus": "MaterialExpressionOneMinus",
-    "Abs": "MaterialExpressionAbs",
-    "Fresnel": "MaterialExpressionFresnel",
-    "Panner": "MaterialExpressionPanner",
-    "WorldPosition": "MaterialExpressionWorldPosition",
-    "VertexColor": "MaterialExpressionVertexColor",
-    "Time": "MaterialExpressionTime",
-    "ScalarParameter": "MaterialExpressionScalarParameter",
-    "VectorParameter": "MaterialExpressionVectorParameter",
-    "TextureSampleParameter2D": "MaterialExpressionTextureSampleParameter2D",
-    "LandscapeLayerBlend": "MaterialExpressionLandscapeLayerBlend",
-    "LandscapeLayerCoords": "MaterialExpressionLandscapeLayerCoords",
+# 短名别名 → 完整 UE 类名后缀（仅用于无法直接拼接的情况）
+NODE_TYPE_ALIASES = {
+    "Lerp": "LinearInterpolate",
 }
+
+# 需要特殊构造逻辑的类型（不能纯靠 set_editor_property）
+SPECIAL_NODE_TYPES = {"LandscapeLayerBlend", "TextureSample", "TextureSampleParameter2D",
+                      "Constant", "Constant3Vector", "Constant4Vector",
+                      "ScalarParameter", "VectorParameter"}
+
+# set_editor_property 时跳过的保留字段
+_RESERVED_FIELDS = {"Type", "Name", "Texture", "Layers", "Value"}
 
 
 def _generate_master_material(template):
@@ -135,15 +120,24 @@ def _generate_master_material(template):
 
     _log(f"生成母材质: {name}")
 
-    # 创建材质资产
-    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    factory = unreal.MaterialFactoryNew()
-    mat = asset_tools.create_asset(name, output_path, unreal.Material, factory)
-    if not mat:
-        _log_error(f"创建材质失败: {name}")
-        return False
-
+    asset_path = output_path + name
     mel = unreal.MaterialEditingLibrary
+
+    # 检查材质是否已存在，存在则更新而不是重建（保留引用）
+    mat = unreal.load_asset(asset_path)
+    if mat and isinstance(mat, unreal.Material):
+        _log(f"  材质已存在，更新模式: {asset_path}")
+        # 清除所有旧表达式节点
+        mel.delete_all_material_expressions(mat)
+        _log(f"  已清除所有旧节点")
+    else:
+        # 创建新材质资产
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        factory = unreal.MaterialFactoryNew()
+        mat = asset_tools.create_asset(name, output_path, unreal.Material, factory)
+        if not mat:
+            _log_error(f"创建材质失败: {name}")
+            return False
 
     # 设置材质属性
     _apply_material_properties(mat, properties)
@@ -204,14 +198,13 @@ def _apply_material_properties(mat, properties):
 
 
 def _create_node(mat, node_data, index=0):
-    """创建材质节点"""
+    """创建材质节点（动态反射模式）"""
     node_type = node_data.get("Type", "")
     node_name = node_data.get("Name", "")
-    ue_class = NODE_TYPE_MAP.get(node_type)
 
-    if not ue_class:
-        _log(f"  未知节点类型: {node_type}，跳过")
-        return None
+    # 动态解析 UE 类名：MaterialExpression{Type}
+    resolved_type = NODE_TYPE_ALIASES.get(node_type, node_type)
+    ue_class_name = f"MaterialExpression{resolved_type}"
 
     mel = unreal.MaterialEditingLibrary
 
@@ -221,42 +214,35 @@ def _create_node(mat, node_data, index=0):
     pos_x = -400 - col * 250
     pos_y = -200 + row * 200
 
-    expr = mel.create_material_expression(mat, getattr(unreal, ue_class, None) or unreal.load_class(None, f"/Script/Engine.{ue_class}"), pos_x, pos_y)
-
-    if not expr:
+    # 动态加载类
+    expr_class = getattr(unreal, ue_class_name, None)
+    if not expr_class:
         try:
-            expr = mel.create_material_expression(mat, unreal.load_class(None, f"/Script/Engine.{ue_class}"), pos_x, pos_y)
+            expr_class = unreal.load_class(None, f"/Script/Engine.{ue_class_name}")
         except Exception:
-            _log(f"  创建节点失败: {node_name} ({node_type})")
-            return None
+            pass
+    if not expr_class:
+        _log(f"  找不到节点类: {ue_class_name}，跳过 {node_name}")
+        return None
 
+    expr = mel.create_material_expression(mat, expr_class, pos_x, pos_y)
     if not expr:
         _log(f"  创建节点失败: {node_name} ({node_type})")
         return None
 
-    # 设置节点属性
-    if node_type == "TextureSample" or node_type == "TextureSampleParameter2D":
+    # === 特殊类型处理（需要非标准属性设置） ===
+    if node_type in ("TextureSample", "TextureSampleParameter2D"):
         tex_path = node_data.get("Texture", "")
         if tex_path:
             tex = unreal.load_asset(tex_path)
             if not tex:
-                # Try with object name appended (e.g. /Game/Path/Name.Name)
                 base_name = tex_path.rsplit("/", 1)[-1] if "/" in tex_path else tex_path
-                full_path = f"{tex_path}.{base_name}"
-                tex = unreal.load_asset(full_path)
+                tex = unreal.load_asset(f"{tex_path}.{base_name}")
             if tex:
                 expr.set_editor_property("Texture", tex)
                 _log(f"  纹理已设置: {node_name} = {tex_path}")
-            else:
-                _log(f"  纹理加载失败: {node_name} = {tex_path}")
         if node_type == "TextureSampleParameter2D":
             expr.set_editor_property("ParameterName", node_name)
-
-    elif node_type == "TextureCoordinate":
-        u_tiling = node_data.get("UTiling", 1.0)
-        v_tiling = node_data.get("VTiling", 1.0)
-        expr.set_editor_property("UTiling", u_tiling)
-        expr.set_editor_property("VTiling", v_tiling)
 
     elif node_type == "Constant":
         expr.set_editor_property("R", float(node_data.get("Value", 0)))
@@ -297,10 +283,16 @@ def _create_node(mat, node_data, index=0):
             expr.set_editor_property("Layers", layer_infos)
             _log(f"  LandscapeLayerBlend: {len(layer_infos)} 层")
 
-    elif node_type == "LandscapeLayerCoords":
-        mapping_type = node_data.get("MappingType", 0)
-        mapping_scale = node_data.get("MappingScale", 1.0)
-        expr.set_editor_property("MappingScale", mapping_scale)
+    # === 通用属性设置：JSON 里非保留字段自动 set_editor_property ===
+    if node_type not in SPECIAL_NODE_TYPES:
+        for key, val in node_data.items():
+            if key in _RESERVED_FIELDS:
+                continue
+            try:
+                expr.set_editor_property(key, float(val) if isinstance(val, (int, float)) else val)
+            except Exception:
+                # 属性可能是 protected 或不存在，静默跳过
+                _log(f"  属性跳过（protected/不存在）: {node_name}.{key}")
 
     _log(f"  节点: {node_name} ({node_type})")
     return expr
@@ -465,12 +457,19 @@ def _generate_material_instance(template):
         _log_error(f"无法加载父材质: {parent_path}")
         return False
 
-    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    factory = unreal.MaterialInstanceConstantFactoryNew()
-    mi = asset_tools.create_asset(name, output_path, unreal.MaterialInstanceConstant, factory)
-    if not mi:
-        _log_error(f"创建材质实例失败: {name}")
-        return False
+    asset_path = output_path + name
+
+    # 检查是否已存在，存在则更新
+    mi = unreal.load_asset(asset_path)
+    if mi and isinstance(mi, unreal.MaterialInstanceConstant):
+        _log(f"  材质实例已存在，更新模式: {asset_path}")
+    else:
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        factory = unreal.MaterialInstanceConstantFactoryNew()
+        mi = asset_tools.create_asset(name, output_path, unreal.MaterialInstanceConstant, factory)
+        if not mi:
+            _log_error(f"创建材质实例失败: {name}")
+            return False
 
     mi.set_editor_property("Parent", parent_mat)
 

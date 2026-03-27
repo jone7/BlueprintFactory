@@ -78,18 +78,34 @@ def generate_blueprint(json_path: str):
         _log_error(f"无法加载父类: {parent_path}")
         return False
 
-    # 创建蓝图资产
+    # 检查蓝图是否已存在，存在则更新
     asset_path = output_path + name
-    factory = unreal.BlueprintFactory()
-    factory.set_editor_property("ParentClass", parent_class)
+    bp = unreal.load_asset(asset_path)
+    if bp and isinstance(bp, unreal.Blueprint):
+        _log(f"  蓝图已存在，更新模式: {asset_path}")
+        # 清除旧组件（保留 DefaultSceneRoot）
+        subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+        old_handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+        if old_handles and len(old_handles) > 1:
+            # 跳过第一个（root），删除其余
+            for h in old_handles[1:]:
+                obj = bfl.get_object_for_handle(h)
+                if obj and obj.get_name() != "DefaultSceneRoot":
+                    subsystem.delete_subobject_from_blueprint(h, bp)
+            _log(f"  已清除旧组件")
+    else:
+        # 创建新蓝图资产
+        factory = unreal.BlueprintFactory()
+        factory.set_editor_property("ParentClass", parent_class)
 
-    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    bp = asset_tools.create_asset(name, output_path, unreal.Blueprint, factory)
-    if not bp:
-        _log_error(f"创建蓝图失败: {asset_path}")
-        return False
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        bp = asset_tools.create_asset(name, output_path, unreal.Blueprint, factory)
+        if not bp:
+            _log_error(f"创建蓝图失败: {asset_path}")
+            return False
 
-    _log(f"蓝图资产已创建: {asset_path}")
+    _log(f"蓝图资产: {asset_path}")
 
     # UE 5.1+ 使用 SubobjectDataSubsystem 添加组件
     subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
@@ -122,14 +138,46 @@ def generate_blueprint(json_path: str):
     if unlua_binding:
         _set_unlua_binding(bp, unlua_binding)
 
-    # 编译蓝图
+    # 先编译蓝图（生成 GeneratedClass）
     try:
         unreal.KismetSystemLibrary.compile_blueprint(bp)
     except Exception:
         try:
             unreal.BlueprintEditorLibrary.compile_blueprint(bp)
         except Exception as e:
-            _log(f"蓝图编译警告（可能仍然有效）: {e}")
+            _log(f"蓝图首次编译警告: {e}")
+
+    # 设置 CDO（Class Default Object）属性
+    cdo_properties = template.get("Properties", {})
+    if cdo_properties and IN_UE:
+        try:
+            bp_gc = unreal.load_object(None, f"{asset_path}.{name}_C")
+            if bp_gc:
+                bp_cdo = unreal.get_default_object(bp_gc)
+                if bp_cdo:
+                    for prop_name, prop_value in cdo_properties.items():
+                        try:
+                            if isinstance(prop_value, str) and prop_value.startswith("/Game/"):
+                                asset = unreal.load_asset(prop_value)
+                                if asset:
+                                    bp_cdo.set_editor_property(prop_name, asset)
+                                    _log(f"  CDO 属性: {prop_name} = {prop_value}")
+                                else:
+                                    _log(f"  CDO 资产未找到: {prop_name} = {prop_value}")
+                            elif isinstance(prop_value, (int, float)):
+                                bp_cdo.set_editor_property(prop_name, float(prop_value))
+                                _log(f"  CDO 属性: {prop_name} = {prop_value}")
+                            else:
+                                bp_cdo.set_editor_property(prop_name, prop_value)
+                                _log(f"  CDO 属性: {prop_name} = {prop_value}")
+                        except Exception as e:
+                            _log(f"  CDO 属性失败: {prop_name}: {e}")
+                else:
+                    _log(f"  get_default_object 返回 None")
+            else:
+                _log(f"  load_object BPGC 失败: {asset_path}.{name}_C")
+        except Exception as e:
+            _log(f"  CDO 异常: {e}")
 
     # 保存
     unreal.EditorAssetLibrary.save_asset(asset_path)
@@ -137,9 +185,8 @@ def generate_blueprint(json_path: str):
     return True
 
 
-# 组件类型映射
-COMPONENT_TYPE_MAP = {
-    "SceneComponent": "SceneComponent",
+# 短名别名 → UE 组件类名（仅用于无法直接拼接的情况）
+COMPONENT_TYPE_ALIASES = {
     "StaticMesh": "StaticMeshComponent",
     "SkeletalMesh": "SkeletalMeshComponent",
     "BoxCollision": "BoxComponent",
@@ -151,30 +198,46 @@ COMPONENT_TYPE_MAP = {
     "Audio": "AudioComponent",
     "Arrow": "ArrowComponent",
     "Billboard": "BillboardComponent",
+    "Spline": "SplineComponent",
+    "SplineMesh": "SplineMeshComponent",
 }
 
-COMPONENT_CLASS_MAP = {
-    "SceneComponent": unreal.SceneComponent if IN_UE else None,
-    "StaticMesh": unreal.StaticMeshComponent if IN_UE else None,
-    "SkeletalMesh": unreal.SkeletalMeshComponent if IN_UE else None,
-    "BoxCollision": unreal.BoxComponent if IN_UE else None,
-    "SphereCollision": unreal.SphereComponent if IN_UE else None,
-    "CapsuleCollision": unreal.CapsuleComponent if IN_UE else None,
-    "PointLight": unreal.PointLightComponent if IN_UE else None,
-    "SpotLight": unreal.SpotLightComponent if IN_UE else None,
-    "ParticleSystem": unreal.ParticleSystemComponent if IN_UE else None,
-    "Audio": unreal.AudioComponent if IN_UE else None,
-    "Arrow": unreal.ArrowComponent if IN_UE else None,
-    "Billboard": unreal.BillboardComponent if IN_UE else None,
-}
+# 需要特殊属性设置的组件类型
+_COMP_RESERVED_FIELDS = {"Type", "Name", "Mesh", "Material", "Location", "Rotation", "Scale",
+                          "Points", "Extent", "Radius", "HalfHeight"}
+
+
+def _resolve_component_class(comp_type):
+    """动态解析组件类"""
+    if not IN_UE:
+        return None
+    # 1. 先查别名
+    ue_name = COMPONENT_TYPE_ALIASES.get(comp_type, comp_type)
+    # 2. 尝试 getattr(unreal, ue_name)
+    cls = getattr(unreal, ue_name, None)
+    if cls:
+        return cls
+    # 3. 尝试加 Component 后缀
+    if not ue_name.endswith("Component"):
+        cls = getattr(unreal, ue_name + "Component", None)
+        if cls:
+            return cls
+    # 4. load_class
+    try:
+        cls = unreal.load_class(None, f"/Script/Engine.{ue_name}")
+        if cls:
+            return cls
+    except Exception:
+        pass
+    return None
 
 
 def _add_component_v2(bp, subsystem, bfl, parent_handle, comp_data):
-    """UE 5.1+ 方式添加组件到蓝图"""
+    """UE 5.1+ 方式添加组件到蓝图（动态反射）"""
     comp_type = comp_data.get("Type", "SceneComponent")
     comp_name = comp_data.get("Name", "NewComponent")
 
-    comp_class = COMPONENT_CLASS_MAP.get(comp_type)
+    comp_class = _resolve_component_class(comp_type)
     if not comp_class:
         _log(f"  未知组件类型: {comp_type}，跳过")
         return None
@@ -220,6 +283,15 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
         else:
             _log(f"    Mesh 未找到（渐进式生成，跳过）: {mesh_path}")
 
+    if comp_type == "StaticMesh" and comp_data.get("Material"):
+        mat_path = comp_data["Material"]
+        mat = unreal.load_asset(mat_path)
+        if mat:
+            comp_obj.set_material(0, mat)
+            _log(f"    设置材质: {mat_path}")
+        else:
+            _log(f"    材质未找到（渐进式生成，跳过）: {mat_path}")
+
     if comp_type == "SkeletalMesh" and comp_data.get("Mesh"):
         mesh_path = comp_data["Mesh"]
         mesh = unreal.load_asset(mesh_path)
@@ -254,6 +326,51 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
     if comp_data.get("Scale"):
         sc = comp_data["Scale"]
         comp_obj.set_editor_property("RelativeScale3D", unreal.Vector(sc[0], sc[1], sc[2]))
+
+    # Spline 组件：设置默认点
+    if comp_type == "Spline" and comp_data.get("Points"):
+        points = comp_data["Points"]
+        # 清除默认点，重新设置
+        num_existing = comp_obj.get_number_of_spline_points()
+        for i in range(len(points)):
+            pt = points[i]
+            pos = unreal.Vector(pt[0], pt[1], pt[2])
+            if i < num_existing:
+                comp_obj.set_location_at_spline_point(i, pos, unreal.SplineCoordinateSpace.LOCAL)
+            else:
+                comp_obj.add_spline_point(pos, unreal.SplineCoordinateSpace.LOCAL, True)
+        # 删除多余的默认点
+        while comp_obj.get_number_of_spline_points() > len(points):
+            comp_obj.remove_spline_point(comp_obj.get_number_of_spline_points() - 1, True)
+        comp_obj.update_spline()
+        _log(f"    Spline 设置 {len(points)} 个点")
+
+    # SplineMesh 组件：设置 Mesh 和材质
+    if comp_type == "SplineMesh":
+        if comp_data.get("Mesh"):
+            mesh = unreal.load_asset(comp_data["Mesh"])
+            if mesh:
+                comp_obj.set_static_mesh(mesh)
+        if comp_data.get("Material"):
+            mat = unreal.load_asset(comp_data["Material"])
+            if mat:
+                comp_obj.set_material(0, mat)
+
+    # === 通用属性：JSON 里非保留字段自动 set_editor_property ===
+    for key, val in comp_data.items():
+        if key in _COMP_RESERVED_FIELDS:
+            continue
+        try:
+            if isinstance(val, str) and val.startswith("/Game/"):
+                asset = unreal.load_asset(val)
+                if asset:
+                    comp_obj.set_editor_property(key, asset)
+            elif isinstance(val, (int, float)):
+                comp_obj.set_editor_property(key, float(val))
+            elif isinstance(val, bool):
+                comp_obj.set_editor_property(key, val)
+        except Exception:
+            pass  # 静默跳过不存在或 protected 的属性
 
 
 def _set_unlua_binding(bp, module_name):
