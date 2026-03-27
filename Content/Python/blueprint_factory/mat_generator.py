@@ -116,6 +116,8 @@ NODE_TYPE_MAP = {
     "ScalarParameter": "MaterialExpressionScalarParameter",
     "VectorParameter": "MaterialExpressionVectorParameter",
     "TextureSampleParameter2D": "MaterialExpressionTextureSampleParameter2D",
+    "LandscapeLayerBlend": "MaterialExpressionLandscapeLayerBlend",
+    "LandscapeLayerCoords": "MaterialExpressionLandscapeLayerCoords",
 }
 
 
@@ -157,6 +159,12 @@ def _generate_master_material(template):
     # 连接节点
     for conn in connections:
         _connect_nodes(mat, mel, node_map, conn)
+
+    # 如果包含 LandscapeLayerBlend 节点，启用 Landscape 用途
+    has_landscape = any(n.get("Type", "").startswith("Landscape") for n in nodes)
+    if has_landscape:
+        mat.set_editor_property("bUsedWithLandscape", True)
+        _log("  启用 Used with Landscape")
 
     # 编译并保存
     mel.recompile_material(mat)
@@ -231,8 +239,16 @@ def _create_node(mat, node_data, index=0):
         tex_path = node_data.get("Texture", "")
         if tex_path:
             tex = unreal.load_asset(tex_path)
+            if not tex:
+                # Try with object name appended (e.g. /Game/Path/Name.Name)
+                base_name = tex_path.rsplit("/", 1)[-1] if "/" in tex_path else tex_path
+                full_path = f"{tex_path}.{base_name}"
+                tex = unreal.load_asset(full_path)
             if tex:
                 expr.set_editor_property("Texture", tex)
+                _log(f"  纹理已设置: {node_name} = {tex_path}")
+            else:
+                _log(f"  纹理加载失败: {node_name} = {tex_path}")
         if node_type == "TextureSampleParameter2D":
             expr.set_editor_property("ParameterName", node_name)
 
@@ -261,6 +277,30 @@ def _create_node(mat, node_data, index=0):
         expr.set_editor_property("ParameterName", node_name)
         val = node_data.get("Value", [0, 0, 0, 1])
         expr.set_editor_property("DefaultValue", unreal.LinearColor(val[0], val[1], val[2], val[3] if len(val) > 3 else 1.0))
+
+    elif node_type == "LandscapeLayerBlend":
+        layers = node_data.get("Layers", [])
+        if layers:
+            layer_infos = []
+            for layer_data in layers:
+                layer_info = unreal.LayerBlendInput()
+                layer_info.set_editor_property("layer_name", layer_data.get("LayerName", ""))
+                blend_type_str = layer_data.get("BlendType", "LB_WeightBlend")
+                if blend_type_str == "LB_HeightBlend":
+                    layer_info.set_editor_property("blend_type", unreal.LandscapeLayerBlendType.LB_HEIGHT_BLEND)
+                elif blend_type_str == "LB_AlphaBlend":
+                    layer_info.set_editor_property("blend_type", unreal.LandscapeLayerBlendType.LB_ALPHA_BLEND)
+                else:
+                    layer_info.set_editor_property("blend_type", unreal.LandscapeLayerBlendType.LB_WEIGHT_BLEND)
+                layer_info.set_editor_property("preview_weight", layer_data.get("PreviewWeight", 0.0))
+                layer_infos.append(layer_info)
+            expr.set_editor_property("Layers", layer_infos)
+            _log(f"  LandscapeLayerBlend: {len(layer_infos)} 层")
+
+    elif node_type == "LandscapeLayerCoords":
+        mapping_type = node_data.get("MappingType", 0)
+        mapping_scale = node_data.get("MappingScale", 1.0)
+        expr.set_editor_property("MappingScale", mapping_scale)
 
     _log(f"  节点: {node_name} ({node_type})")
     return expr
@@ -321,14 +361,57 @@ def _connect_nodes(mat, mel, node_map, conn):
         _log(f"  连线失败: 找不到节点 {from_node_name} 或 {to_node_name}")
         return
 
+    # LandscapeLayerBlend input pins: try multiple name formats
+    actual_to_pin = to_pin
+    is_layer_blend = False
+    if to_expr and hasattr(to_expr, 'get_class'):
+        class_name = str(to_expr.get_class().get_name())
+        if 'LandscapeLayerBlend' in class_name:
+            is_layer_blend = True
+
+    if is_layer_blend and to_pin:
+        # Debug: list all input pins
+        try:
+            inputs = to_expr.get_editor_property("Layers")
+            _log(f"  LayerBlend 层数: {len(inputs)}")
+            for i, layer in enumerate(inputs):
+                ln = layer.get_editor_property("layer_name")
+                _log(f"  LayerBlend 层[{i}]: {ln}")
+        except Exception as dbg_e:
+            _log(f"  LayerBlend 调试失败: {dbg_e}")
+
+        actual_from_pin = from_pin if from_pin else ""
+        pin_formats = [
+            f"Layer {to_pin}",
+            to_pin,
+            f"Layer_{to_pin}",
+            f"Layer {to_pin} ",
+        ]
+        connected = False
+        for pin_name in pin_formats:
+            try:
+                result = mel.connect_material_expressions(from_expr, actual_from_pin, to_expr, pin_name)
+                if result:
+                    _log(f"  连线成功(真): {from_str} → {to_node_name}.{pin_name}")
+                    connected = True
+                    break
+                else:
+                    _log(f"  连线返回False: {from_str} → {to_node_name}.{pin_name}")
+            except Exception as ce:
+                _log(f"  连线异常: {pin_name}: {ce}")
+                continue
+        if not connected:
+            _log(f"  连线全部失败: {from_str} → {to_node_name}.{to_pin}")
+        return
+
     output_index = _get_output_index(from_pin)
-    input_index = _get_input_index(to_pin)
+    input_index = _get_input_index(actual_to_pin)
 
     try:
-        mel.connect_material_expressions(from_expr, from_pin, to_expr, to_pin)
-        _log(f"  连线: {from_str} → {to_str}")
+        mel.connect_material_expressions(from_expr, from_pin, to_expr, actual_to_pin)
+        _log(f"  连线: {from_str} → {to_node_name}.{actual_to_pin}")
     except Exception as e:
-        _log(f"  连线失败: {from_str} → {to_str}: {e}")
+        _log(f"  连线失败: {from_str} → {to_node_name}.{actual_to_pin}: {e}")
 
 
 def _get_output_index(pin_name):
@@ -366,7 +449,7 @@ def _get_material_property(pin_name):
 def _generate_material_instance(template):
     """生成材质实例"""
     name = template.get("Name", "MI_Generated")
-    parent_path = template.get("Parent", "/Engine/EngineMaterials/DefaultMaterial")
+    parent_path = template.get("ParentMaterial", template.get("Parent", "/Engine/EngineMaterials/DefaultMaterial"))
     output_path = template.get("OutputPath", "/Game/Art/Materials/Generated/")
     textures = template.get("Textures", {})
     parameters = template.get("Parameters", {})
