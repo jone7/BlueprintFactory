@@ -169,7 +169,11 @@ def _generate_master_material(template):
 
     # 编译并保存
     mel.recompile_material(mat)
-    mat.post_edit_change()
+    try:
+        mat.post_edit_change()
+    except AttributeError:
+        # UE 5.7: post_edit_change 不再暴露给 Python，recompile_material 已足够
+        pass
     asset_path = output_path + name
     unreal.EditorAssetLibrary.save_asset(asset_path)
 
@@ -216,6 +220,15 @@ def _apply_material_properties(mat, properties):
     if tlm in tlm_map:
         mat.set_editor_property("TranslucencyLightingMode", tlm_map[tlm])
         _log(f"  TranslucencyLightingMode: {tlm}")
+
+    # 通用 bool 属性透传（bUsedWithSplineMeshes, bUsedWithLandscape 等）
+    for key, val in properties.items():
+        if key.startswith("bUsed") and isinstance(val, bool):
+            try:
+                mat.set_editor_property(key, val)
+                _log(f"  {key}: {val}")
+            except Exception as e:
+                _log(f"  警告: 设置 {key} 失败: {e}")
 
 
 def _create_node(mat, node_data, index=0):
