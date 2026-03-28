@@ -100,7 +100,7 @@ NODE_TYPE_ALIASES = {
 # 需要特殊构造逻辑的类型（不能纯靠 set_editor_property）
 SPECIAL_NODE_TYPES = {"LandscapeLayerBlend", "TextureSample", "TextureSampleParameter2D",
                       "Constant", "Constant3Vector", "Constant4Vector",
-                      "ScalarParameter", "VectorParameter"}
+                      "ScalarParameter", "VectorParameter", "Custom"}
 
 # set_editor_property 时跳过的保留字段
 _RESERVED_FIELDS = {"Type", "Name", "Texture", "Layers", "Value"}
@@ -126,12 +126,11 @@ def _generate_master_material(template):
     # 检查材质是否已存在，存在则更新而不是重建（保留引用）
     mat = unreal.load_asset(asset_path)
     if mat and isinstance(mat, unreal.Material):
-        _log(f"  材质已存在，更新模式: {asset_path}")
-        # 清除所有旧表达式节点
-        mel.delete_all_material_expressions(mat)
-        _log(f"  已清除所有旧节点")
-    else:
-        # 创建新材质资产
+        _log(f"  材质已存在，删除后重建: {asset_path}")
+        unreal.EditorAssetLibrary.delete_asset(asset_path)
+        mat = None
+
+    if not mat:
         asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
         factory = unreal.MaterialFactoryNew()
         mat = asset_tools.create_asset(name, output_path, unreal.Material, factory)
@@ -142,6 +141,13 @@ def _generate_master_material(template):
     # 设置材质属性
     _apply_material_properties(mat, properties)
 
+    # 清除所有材质输出引脚的连线（防止旧连线残留）
+    for prop_name, prop_enum in MATERIAL_OUTPUTS.items():
+        try:
+            mel.clear_material_property(mat, _get_material_property(prop_name))
+        except Exception:
+            pass
+
     # 创建节点
     node_map = {}  # name → expression
     for idx, node_data in enumerate(nodes):
@@ -149,6 +155,7 @@ def _generate_master_material(template):
         if expr:
             node_name = node_data.get("Name", "")
             node_map[node_name] = expr
+            _log(f"  node_map['{node_name}'] = {expr.get_class().get_name()} @ {id(expr)}")
 
     # 连接节点
     for conn in connections:
@@ -162,6 +169,7 @@ def _generate_master_material(template):
 
     # 编译并保存
     mel.recompile_material(mat)
+    mat.post_edit_change()
     asset_path = output_path + name
     unreal.EditorAssetLibrary.save_asset(asset_path)
 
@@ -196,6 +204,19 @@ def _apply_material_properties(mat, properties):
     if shading in shading_map:
         mat.set_editor_property("ShadingModel", shading_map[shading])
 
+    tlm = properties.get("TranslucencyLightingMode", "")
+    tlm_map = {
+        "TLM_VolumetricNonDirectional": unreal.TranslucencyLightingMode.TLM_VOLUMETRIC_NON_DIRECTIONAL,
+        "TLM_VolumetricDirectional": unreal.TranslucencyLightingMode.TLM_VOLUMETRIC_DIRECTIONAL,
+        "TLM_VolumetricPerVertexNonDirectional": unreal.TranslucencyLightingMode.TLM_VOLUMETRIC_PER_VERTEX_NON_DIRECTIONAL,
+        "TLM_VolumetricPerVertexDirectional": unreal.TranslucencyLightingMode.TLM_VOLUMETRIC_PER_VERTEX_DIRECTIONAL,
+        "TLM_Surface": unreal.TranslucencyLightingMode.TLM_SURFACE,
+        "TLM_SurfacePerPixelLighting": unreal.TranslucencyLightingMode.TLM_SURFACE_PER_PIXEL_LIGHTING,
+    }
+    if tlm in tlm_map:
+        mat.set_editor_property("TranslucencyLightingMode", tlm_map[tlm])
+        _log(f"  TranslucencyLightingMode: {tlm}")
+
 
 def _create_node(mat, node_data, index=0):
     """创建材质节点（动态反射模式）"""
@@ -208,11 +229,33 @@ def _create_node(mat, node_data, index=0):
 
     mel = unreal.MaterialEditingLibrary
 
-    # 按索引排列：每行 3 个节点，间距 250
-    col = index % 3
-    row = index // 3
-    pos_x = -400 - col * 250
-    pos_y = -200 + row * 200
+    # 按节点类型分区域排列，从左到右流向材质输出
+    # 纹理采样节点放中间偏左，UV/Panner放最左，Custom放中间
+    _NODE_POSITIONS = {}  # 由 JSON 模板的 "Position" 字段或自动计算
+
+    node_pos = node_data.get("Position", None)
+    if node_pos:
+        pos_x = node_pos[0]
+        pos_y = node_pos[1]
+    else:
+        # 自动布局：按类型分列
+        if node_type in ("TextureCoordinate",):
+            pos_x = -1200
+            pos_y = -200 + index * 200
+        elif node_type in ("Panner",):
+            pos_x = -900
+            pos_y = -200 + index * 200
+        elif node_type in ("TextureSample", "TextureSampleParameter2D"):
+            pos_x = -600
+            pos_y = -200 + index * 200
+        elif node_type in ("Custom",):
+            pos_x = -300
+            pos_y = 0
+        else:
+            col = index % 2
+            row = index // 2
+            pos_x = -600 - col * 400
+            pos_y = -300 + row * 250
 
     # 动态加载类
     expr_class = getattr(unreal, ue_class_name, None)
@@ -243,6 +286,10 @@ def _create_node(mat, node_data, index=0):
                 _log(f"  纹理已设置: {node_name} = {tex_path}")
         if node_type == "TextureSampleParameter2D":
             expr.set_editor_property("ParameterName", node_name)
+            # 设置 SamplerType（Normal 贴图需要 SAMPLERTYPE_NORMAL）
+            sampler_type = node_data.get("SamplerType", "")
+            if sampler_type == "Normal":
+                expr.set_editor_property("SamplerType", unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
 
     elif node_type == "Constant":
         expr.set_editor_property("R", float(node_data.get("Value", 0)))
@@ -263,6 +310,51 @@ def _create_node(mat, node_data, index=0):
         expr.set_editor_property("ParameterName", node_name)
         val = node_data.get("Value", [0, 0, 0, 1])
         expr.set_editor_property("DefaultValue", unreal.LinearColor(val[0], val[1], val[2], val[3] if len(val) > 3 else 1.0))
+
+    elif node_type == "Custom":
+        code = node_data.get("Code", "return 0;")
+        expr.set_editor_property("Code", code)
+        expr.set_editor_property("Description", node_name)
+        # OutputType: try enum, fallback to int
+        output_type_str = str(node_data.get("OutputType", "float3")).lower()
+        ot_int = {"float": 0, "float1": 0, "float2": 1, "float3": 2, "float4": 3}.get(output_type_str, 2)
+        try:
+            ot_enum = getattr(unreal.CustomMaterialOutputType, ["CMOT_FLOAT1","CMOT_FLOAT2","CMOT_FLOAT3","CMOT_FLOAT4"][ot_int])
+            expr.set_editor_property("OutputType", ot_enum)
+        except Exception:
+            try:
+                expr.set_editor_property("OutputType", ot_int)
+            except Exception as e2:
+                _log(f"  OutputType 设置失败: {e2}")
+        # Additional outputs
+        additional_outputs = node_data.get("AdditionalOutputs", [])
+        if additional_outputs:
+            ao_array = []
+            for ao in additional_outputs:
+                co = unreal.CustomOutput()
+                co.set_editor_property("OutputName", ao.get("Name", ""))
+                ao_str = str(ao.get("Type", "float3")).lower()
+                ao_int = {"float": 0, "float1": 0, "float2": 1, "float3": 2, "float4": 3}.get(ao_str, 2)
+                try:
+                    ao_enum = getattr(unreal.CustomMaterialOutputType, ["CMOT_FLOAT1","CMOT_FLOAT2","CMOT_FLOAT3","CMOT_FLOAT4"][ao_int])
+                    co.set_editor_property("OutputType", ao_enum)
+                except Exception:
+                    try:
+                        co.set_editor_property("OutputType", ao_int)
+                    except Exception:
+                        pass
+                ao_array.append(co)
+            expr.set_editor_property("AdditionalOutputs", ao_array)
+        # Inputs
+        inputs = node_data.get("Inputs", [])
+        if inputs:
+            input_array = []
+            for inp in inputs:
+                ci = unreal.CustomInput()
+                ci.set_editor_property("InputName", inp.get("Name", ""))
+                input_array.append(ci)
+            expr.set_editor_property("Inputs", input_array)
+        _log(f"  Custom 节点: {node_name}, {len(inputs)} 输入, code={len(code)} chars")
 
     elif node_type == "LandscapeLayerBlend":
         layers = node_data.get("Layers", [])
@@ -289,7 +381,12 @@ def _create_node(mat, node_data, index=0):
             if key in _RESERVED_FIELDS:
                 continue
             try:
-                expr.set_editor_property(key, float(val) if isinstance(val, (int, float)) else val)
+                if isinstance(val, bool):
+                    expr.set_editor_property(key, val)
+                elif isinstance(val, (int, float)):
+                    expr.set_editor_property(key, float(val))
+                else:
+                    expr.set_editor_property(key, val)
             except Exception:
                 # 属性可能是 protected 或不存在，静默跳过
                 _log(f"  属性跳过（protected/不存在）: {node_name}.{key}")
@@ -323,9 +420,8 @@ def _connect_nodes(mat, mel, node_map, conn):
             _log(f"  连线失败: 找不到源节点 {from_node_name}")
             return
 
-        # from_pin: 源节点的输出引脚名（如 "RGB", "" 等）
-        # to_pin: 材质属性名（如 "BaseColor", "Roughness" 等）
         mat_prop = _get_material_property(to_pin)
+        _log(f"  连线材质输出: {from_node_name}({from_expr.get_class().get_name()}) → Material.{to_pin} (prop={mat_prop})")
 
         try:
             # connect_material_property(from_expression, output_name, property)
@@ -400,8 +496,11 @@ def _connect_nodes(mat, mel, node_map, conn):
     input_index = _get_input_index(actual_to_pin)
 
     try:
-        mel.connect_material_expressions(from_expr, from_pin, to_expr, actual_to_pin)
-        _log(f"  连线: {from_str} → {to_node_name}.{actual_to_pin}")
+        result = mel.connect_material_expressions(from_expr, from_pin, to_expr, actual_to_pin)
+        if result:
+            _log(f"  连线OK: {from_str} → {to_node_name}.{actual_to_pin}")
+        else:
+            _log(f"  连线返回False: {from_str} → {to_node_name}.{actual_to_pin}")
     except Exception as e:
         _log(f"  连线失败: {from_str} → {to_node_name}.{actual_to_pin}: {e}")
 
@@ -430,6 +529,8 @@ def _get_material_property(pin_name):
         "Opacity": unreal.MaterialProperty.MP_OPACITY,
         "OpacityMask": unreal.MaterialProperty.MP_OPACITY_MASK,
         "AmbientOcclusion": unreal.MaterialProperty.MP_AMBIENT_OCCLUSION,
+        "WorldPositionOffset": unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET,
+        "Refraction": unreal.MaterialProperty.MP_REFRACTION,
     }
     return prop_map.get(pin_name, unreal.MaterialProperty.MP_BASE_COLOR)
 
