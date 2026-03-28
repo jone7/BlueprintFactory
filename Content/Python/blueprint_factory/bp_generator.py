@@ -90,7 +90,15 @@ def generate_blueprint(json_path: str):
         if old_handles and len(old_handles) > 1:
             # 跳过第一个（root），删除其余
             for h in old_handles[1:]:
-                obj = bfl.get_object_for_handle(h)
+                # UE 5.7: get_object_for_handle 移到 SubobjectDataSubsystem
+                obj = None
+                try:
+                    obj = bfl.get_object_for_handle(h)
+                except AttributeError:
+                    try:
+                        obj = subsystem.get_object_for_handle(h)
+                    except Exception:
+                        pass
                 if obj and obj.get_name() != "DefaultSceneRoot":
                     subsystem.delete_subobject_from_blueprint(h, bp)
             _log(f"  已清除旧组件")
