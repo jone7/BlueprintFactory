@@ -266,6 +266,33 @@ def _h_noise(cx, cy, r):
 register_handler("noise", _h_noise)
 
 
+def _h_fractal(cx, cy, r):
+    """多层分形噪声，打破规则性，模拟自然地形起伏"""
+    octaves = r.get("octaves", 5)
+    base_freq = r.get("frequency", 4.0)
+    amp = r.get("amplitude", 150)
+    persistence = r.get("persistence", 0.45)
+    lacunarity = r.get("lacunarity", 2.17)
+    ox = r.get("offsetX", 0.0)
+    oy = r.get("offsetY", 0.0)
+
+    h = 0.0
+    freq = base_freq
+    a = amp
+    for i in range(octaves):
+        px = (cx + ox) * freq * math.pi * 2
+        py = (cy + oy) * freq * math.pi * 2
+        v = (math.sin(px + math.cos(py * 0.7)) * 0.5
+             + math.cos(py + math.sin(px * 1.3)) * 0.3
+             + math.sin(px * 0.6 - py * 0.8) * 0.2)
+        h += v * a
+        freq *= lacunarity
+        a *= persistence
+    return h
+
+register_handler("fractal", _h_fractal)
+
+
 def _h_cliff(cx, cy, r):
     """Steep cliff edge."""
     b = r.get("bounds", [0, 0, 1, 1])
@@ -323,3 +350,92 @@ def _h_crater(cx, cy, r):
     return 0.0
 
 register_handler("crater", _h_crater)
+
+
+def convert_image_to_r16(image_path, target_size=505, output_path=None, height_scale=0.15, invert=False, blur_radius=3):
+    """将灰度图片转换为 .r16 高度图"""
+    pixels = None
+    src_w = src_h = 0
+
+    # 方法1: 用 Pillow（系统 Python 或已安装）
+    try:
+        from PIL import Image, ImageFilter
+        img = Image.open(image_path).convert('L')
+        img = img.resize((target_size, target_size), Image.LANCZOS)
+        if blur_radius > 0:
+            img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        pixels = list(img.getdata())
+        _log("Read image with PIL: %dx%d" % (target_size, target_size))
+    except ImportError:
+        pass
+
+    # 方法2: 用 subprocess 调系统 Python（UE Python 没有 Pillow 时）
+    if pixels is None:
+        import subprocess, sys, tempfile, json as _json
+        _log("PIL not in UE Python, trying system Python...")
+        # 写一个临时脚本让系统 Python 执行
+        script = '''# -*- coding: utf-8 -*-
+import json, struct
+from PIL import Image, ImageFilter
+img = Image.open(r"%s").convert("L")
+img = img.resize((%d, %d), Image.LANCZOS)
+blur = %d
+if blur > 0:
+    img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+pixels = list(img.getdata())
+with open(r"%s", "wb") as f:
+    f.write(bytes(bytearray(pixels)))
+print("OK")
+'''
+        tmp_raw = os.path.join(tempfile.gettempdir(), "heightmap_raw.bin")
+        script_filled = script % (image_path, target_size, target_size, blur_radius, tmp_raw)
+        tmp_script = os.path.join(tempfile.gettempdir(), "hm_convert.py")
+        with open(tmp_script, "w") as f:
+            f.write(script_filled)
+
+        try:
+            result = subprocess.run(["python3", tmp_script], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 and os.path.isfile(tmp_raw):
+                with open(tmp_raw, "rb") as f:
+                    raw = f.read()
+                pixels = list(raw)
+                os.remove(tmp_raw)
+                os.remove(tmp_script)
+                _log("Read image via system Python: %d pixels" % len(pixels))
+            else:
+                _log("System Python failed: " + result.stderr[:200])
+                return None
+        except Exception as e:
+            _log("System Python error: " + str(e))
+            return None
+
+    if pixels is None or len(pixels) != target_size * target_size:
+        _log("ERROR: pixel count mismatch")
+        return None
+
+    if invert:
+        pixels = [255 - p for p in pixels]
+
+    # 以中位数为 Z=0 基准
+    sorted_px = sorted(pixels)
+    median_val = sorted_px[len(sorted_px) // 2]
+    _log("Median gray: %d, scale: %.2f" % (median_val, height_scale))
+
+    data = bytearray()
+    for p in pixels:
+        normalized = (p - median_val) / 255.0
+        val = int(MID + normalized * 32767 * height_scale * 4)
+        val = max(0, min(65535, val))
+        data += struct.pack('<H', val)
+
+    if not output_path:
+        out_dir = os.path.dirname(image_path)
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        output_path = os.path.join(out_dir, base_name + "_" + ts + ".r16")
+
+    with open(output_path, 'wb') as f:
+        f.write(data)
+
+    _log("Image -> r16: %s (%dx%d)" % (output_path, target_size, target_size))
+    return output_path
