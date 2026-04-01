@@ -369,24 +369,72 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
         if key in _COMP_RESERVED_FIELDS:
             continue
         try:
-            if isinstance(val, str) and val.startswith("/Game/"):
-                asset = unreal.load_asset(val)
-                if asset:
-                    comp_obj.set_editor_property(key, asset)
-            elif isinstance(val, (int, float)):
-                comp_obj.set_editor_property(key, float(val))
-            elif isinstance(val, bool):
+            if isinstance(val, bool):
                 comp_obj.set_editor_property(key, val)
+            elif isinstance(val, (int, float)):
+                comp_obj.set_editor_property(key, val)
+            elif isinstance(val, str):
+                assigned = False
+                if val.startswith("/Game/"):
+                    asset = unreal.load_asset(val)
+                    if asset:
+                        comp_obj.set_editor_property(key, asset)
+                        assigned = True
+                    else:
+                        cls = unreal.load_class(None, val)
+                        if cls:
+                            comp_obj.set_editor_property(key, cls)
+                            assigned = True
+                elif val.startswith("/Script/"):
+                    cls = unreal.load_class(None, val)
+                    if cls:
+                        comp_obj.set_editor_property(key, cls)
+                        assigned = True
+
+                if not assigned:
+                    comp_obj.set_editor_property(key, val)
         except Exception:
             pass  # 静默跳过不存在或 protected 的属性
 
 
-def _set_unlua_binding(bp, module_name):
-    """设置 UnLua 绑定（通过接口实现）"""
+def _resolve_unlua_binding(unlua_binding):
+    if isinstance(unlua_binding, dict):
+        if not unlua_binding.get("Enabled", True):
+            return ""
+        return str(unlua_binding.get("ModuleName", "") or "")
+    if isinstance(unlua_binding, str):
+        return unlua_binding
+    return ""
+
+
+def _set_unlua_binding(bp, unlua_binding):
+    """设置 UnLua 绑定（自动实现 UnLuaInterface + GetModuleName）"""
     try:
-        # UnLua 绑定通过 GetModuleName 接口实现
-        # 需要蓝图实现 UnLuaInterface
-        _log(f"  UnLua 绑定: {module_name}（需手动在蓝图中设置 UnLuaInterface）")
+        module_name = _resolve_unlua_binding(unlua_binding)
+        if not module_name:
+            return
+
+        lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+        if not lib:
+            _log("  UnLua 绑定跳过：未找到 BPFactoryBlueprintLibrary")
+            return
+
+        bind_func = None
+        for func_name in ("setup_unlua_binding", "setup_un_lua_binding", "SetupUnLuaBinding"):
+            candidate = getattr(lib, func_name, None)
+            if callable(candidate):
+                bind_func = candidate
+                break
+
+        if not bind_func:
+            _log("  UnLua 绑定跳过：未找到 SetupUnLuaBinding 接口")
+            return
+
+        ok = bool(bind_func(bp, module_name))
+        if ok:
+            _log(f"  UnLua 绑定完成: {module_name}")
+        else:
+            _log(f"  UnLua 绑定失败: {module_name}")
     except Exception as e:
         _log(f"  UnLua 绑定设置失败: {e}")
 

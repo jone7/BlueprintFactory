@@ -1,5 +1,6 @@
 #pragma once
 #include "CoreMinimal.h"
+#include "Engine/Blueprint.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "BPFactoryBlueprintLibrary.generated.h"
 
@@ -44,4 +45,12 @@ public:
 		float ScaleY,
 		float ScaleZ,
 		const FString& HeightmapPath);
+
+	/** 检测 UnLua 是否可用 */
+	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
+	static bool IsUnLuaAvailable();
+
+	/** 为 Blueprint 自动挂载 UnLuaInterface 并设置 GetModuleName */
+	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
+	static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
 };
