@@ -60,6 +60,7 @@ def generate_blueprint(json_path: str):
     parent = template.get("ParentClass", "Actor")
     output_path = template.get("OutputPath", "/Game/Blueprints/Generated/")
     components = template.get("Components", [])
+    preserve_existing_components = template.get("PreserveExistingComponents", False)
     unlua_binding = template.get("UnLuaBinding", "")
 
     if not IN_UE:
@@ -83,25 +84,28 @@ def generate_blueprint(json_path: str):
     bp = unreal.load_asset(asset_path)
     if bp and isinstance(bp, unreal.Blueprint):
         _log(f"  蓝图已存在，更新模式: {asset_path}")
-        # 清除旧组件（保留 DefaultSceneRoot）
-        subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
-        bfl = unreal.SubobjectDataBlueprintFunctionLibrary
-        old_handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
-        if old_handles and len(old_handles) > 1:
-            # 跳过第一个（root），删除其余
-            for h in old_handles[1:]:
-                # UE 5.7: get_object_for_handle 移到 SubobjectDataSubsystem
-                obj = None
-                try:
-                    obj = bfl.get_object_for_handle(h)
-                except AttributeError:
+        if preserve_existing_components:
+            _log("  保留现有组件，仅更新属性/绑定")
+        else:
+            # 清除旧组件（保留 DefaultSceneRoot）
+            subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+            bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+            old_handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+            if old_handles and len(old_handles) > 1:
+                # 跳过第一个（root），删除其余
+                for h in old_handles[1:]:
+                    # UE 5.7: get_object_for_handle 移到 SubobjectDataSubsystem
+                    obj = None
                     try:
-                        obj = subsystem.get_object_for_handle(h)
-                    except Exception:
-                        pass
-                if obj and obj.get_name() != "DefaultSceneRoot":
-                    subsystem.delete_subobject_from_blueprint(h, bp)
-            _log(f"  已清除旧组件")
+                        obj = bfl.get_object_for_handle(h)
+                    except AttributeError:
+                        try:
+                            obj = subsystem.get_object_for_handle(h)
+                        except Exception:
+                            pass
+                    if obj and obj.get_name() != "DefaultSceneRoot":
+                        subsystem.delete_subobject_from_blueprint(h, bp)
+                _log(f"  已清除旧组件")
     else:
         # 创建新蓝图资产
         factory = unreal.BlueprintFactory()
@@ -165,13 +169,30 @@ def generate_blueprint(json_path: str):
                 if bp_cdo:
                     for prop_name, prop_value in cdo_properties.items():
                         try:
-                            if isinstance(prop_value, str) and prop_value.startswith("/Game/"):
-                                asset = unreal.load_asset(prop_value)
-                                if asset:
-                                    bp_cdo.set_editor_property(prop_name, asset)
+                            if isinstance(prop_value, str):
+                                assigned = False
+                                if prop_value.startswith("/Game/"):
+                                    asset = unreal.load_asset(prop_value)
+                                    if asset:
+                                        bp_cdo.set_editor_property(prop_name, asset)
+                                        _log(f"  CDO 属性: {prop_name} = {prop_value}")
+                                        assigned = True
+                                    else:
+                                        cls = unreal.load_class(None, prop_value)
+                                        if cls:
+                                            bp_cdo.set_editor_property(prop_name, cls)
+                                            _log(f"  CDO 类属性: {prop_name} = {prop_value}")
+                                            assigned = True
+                                elif prop_value.startswith("/Script/"):
+                                    cls = unreal.load_class(None, prop_value)
+                                    if cls:
+                                        bp_cdo.set_editor_property(prop_name, cls)
+                                        _log(f"  CDO 类属性: {prop_name} = {prop_value}")
+                                        assigned = True
+
+                                if not assigned:
+                                    bp_cdo.set_editor_property(prop_name, prop_value)
                                     _log(f"  CDO 属性: {prop_name} = {prop_value}")
-                                else:
-                                    _log(f"  CDO 资产未找到: {prop_name} = {prop_value}")
                             elif isinstance(prop_value, (int, float)):
                                 bp_cdo.set_editor_property(prop_name, float(prop_value))
                                 _log(f"  CDO 属性: {prop_name} = {prop_value}")
