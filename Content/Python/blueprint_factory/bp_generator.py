@@ -142,6 +142,13 @@ def generate_blueprint(json_path: str):
             # 跳过 Root SceneComponent，使用默认的 DefaultSceneRoot
             continue
 
+        if preserve_existing_components:
+            existing_comp = _find_existing_component_template(bp, comp_name)
+            if existing_comp:
+                _set_component_properties(existing_comp, comp_type, comp_data)
+                _log(f"  Updated existing component: {comp_name} ({comp_type})")
+                continue
+
         result = _add_component_v2(bp, subsystem, bfl, scene_root_handle, comp_data)
         if result is None:
             _log(f"  组件添加失败: {comp_name}")
@@ -236,6 +243,21 @@ _COMP_RESERVED_FIELDS = {"Type", "Name", "Mesh", "Material", "Location", "Rotati
                           "Points", "Extent", "Radius", "HalfHeight"}
 
 
+def _find_existing_component_template(bp, comp_name):
+    """Find an existing component template by component name."""
+    try:
+        scs = bp.get_editor_property("SimpleConstructionScript")
+        if not scs:
+            return None
+        for node in scs.get_all_nodes():
+            comp = node.get_editor_property("ComponentTemplate")
+            if comp and comp.get_name() == comp_name:
+                return comp
+    except Exception:
+        return None
+    return None
+
+
 def _resolve_component_class(comp_type):
     """动态解析组件类"""
     if not IN_UE:
@@ -301,6 +323,38 @@ def _add_component_v2(bp, subsystem, bfl, parent_handle, comp_data):
     return sub_handle
 
 
+def _set_collision_profile(comp_obj, profile_name):
+    if not profile_name:
+        return
+    try:
+        if hasattr(comp_obj, "set_collision_profile_name"):
+            comp_obj.set_collision_profile_name(profile_name)
+            return
+    except Exception:
+        pass
+    for prop_name in ("CollisionProfileName", "collision_profile_name"):
+        try:
+            comp_obj.set_editor_property(prop_name, profile_name)
+            return
+        except Exception:
+            pass
+
+
+def _set_can_affect_navigation(comp_obj, enabled):
+    try:
+        if hasattr(comp_obj, "set_can_ever_affect_navigation"):
+            comp_obj.set_can_ever_affect_navigation(enabled)
+            return
+    except Exception:
+        pass
+    for prop_name in ("bCanEverAffectNavigation", "can_ever_affect_navigation"):
+        try:
+            comp_obj.set_editor_property(prop_name, enabled)
+            return
+        except Exception:
+            pass
+
+
 def _set_component_properties(comp_obj, comp_type, comp_data):
     """设置组件属性"""
     if comp_type == "StaticMesh" and comp_data.get("Mesh"):
@@ -355,6 +409,12 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
     if comp_data.get("Scale"):
         sc = comp_data["Scale"]
         comp_obj.set_editor_property("RelativeScale3D", unreal.Vector(sc[0], sc[1], sc[2]))
+
+    if "CollisionProfileName" in comp_data:
+        _set_collision_profile(comp_obj, comp_data.get("CollisionProfileName"))
+
+    if "bCanEverAffectNavigation" in comp_data:
+        _set_can_affect_navigation(comp_obj, bool(comp_data.get("bCanEverAffectNavigation")))
 
     # Spline 组件：设置默认点
     if comp_type == "Spline" and comp_data.get("Points"):
