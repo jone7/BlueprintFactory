@@ -186,6 +186,19 @@ def _apply_material_properties(mat, properties):
     if not properties:
         return
 
+    material_domain = properties.get("MaterialDomain", "")
+    material_domain_map = {
+        "Surface": unreal.MaterialDomain.MD_SURFACE,
+        "DeferredDecal": unreal.MaterialDomain.MD_DEFERRED_DECAL,
+        "LightFunction": unreal.MaterialDomain.MD_LIGHT_FUNCTION,
+        "Volume": unreal.MaterialDomain.MD_VOLUME,
+        "PostProcess": unreal.MaterialDomain.MD_POST_PROCESS,
+        "UserInterface": unreal.MaterialDomain.MD_UI,
+        "UI": unreal.MaterialDomain.MD_UI,
+    }
+    if material_domain in material_domain_map:
+        mat.set_editor_property("MaterialDomain", material_domain_map[material_domain])
+
     if "TwoSided" in properties:
         mat.set_editor_property("TwoSided", properties["TwoSided"])
 
