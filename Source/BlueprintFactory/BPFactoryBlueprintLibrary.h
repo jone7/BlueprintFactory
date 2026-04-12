@@ -53,4 +53,13 @@ public:
 	/** 为 Blueprint 自动挂载 UnLuaInterface 并设置 GetModuleName */
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
 	static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
+	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+	static bool SetupQuadrupedBeastStateMachine(
+		class UAnimBlueprint* AnimBlueprint,
+		const FString& StateMachineName,
+		const FString& IdleAnimationAssetPath,
+		const FString& WalkAnimationAssetPath,
+		const FString& SitAnimationAssetPath,
+		const FString& SleepAnimationAssetPath,
+		const FString& SniffAnimationAssetPath);
 };

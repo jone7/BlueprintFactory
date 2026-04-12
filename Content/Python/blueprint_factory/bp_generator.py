@@ -240,21 +240,67 @@ COMPONENT_TYPE_ALIASES = {
 
 # 需要特殊属性设置的组件类型
 _COMP_RESERVED_FIELDS = {"Type", "Name", "Mesh", "Material", "Location", "Rotation", "Scale",
-                          "Points", "Extent", "Radius", "HalfHeight"}
+                          "Points", "Extent", "Radius", "HalfHeight", "AnimationMode", "AnimClass",
+                          "AnimToPlay", "AnimationAsset"}
 
 
 def _find_existing_component_template(bp, comp_name):
-    """Find an existing component template by component name."""
+    """Find an existing component template by component name.
+
+    This covers both components defined directly on the blueprint and
+    inherited components that need child-blueprint overrides.
+    """
     try:
         scs = bp.get_editor_property("SimpleConstructionScript")
         if not scs:
-            return None
-        for node in scs.get_all_nodes():
-            comp = node.get_editor_property("ComponentTemplate")
-            if comp and comp.get_name() == comp_name:
-                return comp
+            scs = None
+        if scs:
+            for node in scs.get_all_nodes():
+                comp = node.get_editor_property("ComponentTemplate")
+                if comp and comp.get_name() == comp_name:
+                    return comp
     except Exception:
-        return None
+        pass
+
+    # Fallback: inspect the reflected subobject tree so we can override
+    # inherited components such as Character's built-in Mesh component.
+    try:
+        subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+        if subsystem and bfl:
+            handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+            for handle in handles:
+                try:
+                    data = bfl.get_data(handle)
+                except Exception:
+                    data = None
+
+                if not data or not bfl.is_component(data):
+                    continue
+
+                variable_name = ""
+                try:
+                    variable_name = str(bfl.get_variable_name(data))
+                except Exception:
+                    variable_name = ""
+
+                comp = None
+                try:
+                    comp = bfl.get_object_for_blueprint(data, bp)
+                except Exception:
+                    try:
+                        comp = bfl.get_associated_object(data)
+                    except Exception:
+                        comp = None
+
+                if not comp:
+                    continue
+
+                if variable_name == comp_name or comp.get_name() == comp_name:
+                    return comp
+    except Exception:
+        pass
+
     return None
 
 
@@ -355,6 +401,77 @@ def _set_can_affect_navigation(comp_obj, enabled):
             pass
 
 
+def _set_animation_mode(comp_obj, mode_name):
+    if not mode_name:
+        return
+
+    mode_map = {
+        "UseAnimationBlueprint": unreal.AnimationMode.ANIMATION_BLUEPRINT,
+        "AnimationBlueprint": unreal.AnimationMode.ANIMATION_BLUEPRINT,
+        "AnimBlueprint": unreal.AnimationMode.ANIMATION_BLUEPRINT,
+        "UseAnimationAsset": unreal.AnimationMode.ANIMATION_SINGLE_NODE,
+        "AnimationAsset": unreal.AnimationMode.ANIMATION_SINGLE_NODE,
+        "SingleNode": unreal.AnimationMode.ANIMATION_SINGLE_NODE,
+        "AnimationCustomMode": unreal.AnimationMode.ANIMATION_CUSTOM_MODE,
+        "CustomMode": unreal.AnimationMode.ANIMATION_CUSTOM_MODE,
+    }
+
+    mode_value = mode_map.get(str(mode_name), None)
+    if mode_value is None:
+        _log(f"    Unknown AnimationMode, skipped: {mode_name}")
+        return
+
+    try:
+        comp_obj.set_editor_property("AnimationMode", mode_value)
+    except Exception as exc:
+        _log(f"    Failed to set AnimationMode {mode_name}: {exc}")
+
+
+def _set_anim_class(comp_obj, class_path):
+    if not class_path:
+        return
+
+    anim_class = None
+    try:
+        anim_class = unreal.load_class(None, class_path)
+    except Exception:
+        anim_class = None
+
+    if not anim_class:
+        try:
+            anim_class = unreal.load_object(None, class_path)
+        except Exception:
+            anim_class = None
+
+    if not anim_class:
+        _log(f"    AnimClass not found, skipped: {class_path}")
+        return
+
+    try:
+        comp_obj.set_editor_property("AnimClass", anim_class)
+        _log(f"    设置 AnimClass: {class_path}")
+    except Exception as exc:
+        _log(f"    Failed to set AnimClass {class_path}: {exc}")
+
+
+def _set_anim_asset(comp_obj, asset_path):
+    if not asset_path:
+        return
+
+    anim_asset = unreal.load_asset(asset_path)
+    if not anim_asset:
+        _log(f"    AnimationAsset not found, skipped: {asset_path}")
+        return
+
+    for prop_name in ("AnimToPlay", "AnimationData"):
+        try:
+            comp_obj.set_editor_property(prop_name, anim_asset)
+            _log(f"    设置 AnimationAsset: {asset_path}")
+            return
+        except Exception:
+            pass
+
+
 def _set_component_properties(comp_obj, comp_type, comp_data):
     """设置组件属性"""
     if comp_type == "StaticMesh" and comp_data.get("Mesh"):
@@ -383,6 +500,17 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
             _log(f"    设置 SkeletalMesh: {mesh_path}")
         else:
             _log(f"    SkeletalMesh 未找到（渐进式生成，跳过）: {mesh_path}")
+
+    if comp_type == "SkeletalMesh" and comp_data.get("AnimationMode"):
+        _set_animation_mode(comp_obj, comp_data.get("AnimationMode"))
+
+    if comp_type == "SkeletalMesh" and comp_data.get("AnimClass"):
+        _set_anim_class(comp_obj, comp_data.get("AnimClass"))
+
+    if comp_type == "SkeletalMesh":
+        anim_asset_path = comp_data.get("AnimToPlay") or comp_data.get("AnimationAsset")
+        if anim_asset_path:
+            _set_anim_asset(comp_obj, anim_asset_path)
 
     if comp_type == "BoxCollision" and comp_data.get("Extent"):
         ext = comp_data["Extent"]

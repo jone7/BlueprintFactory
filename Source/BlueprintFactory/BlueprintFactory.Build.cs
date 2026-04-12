@@ -30,6 +30,7 @@ public class BlueprintFactory : ModuleRules
 		{
 			"Kismet",
 			"BlueprintGraph",
+			"AnimGraph",
 		});
 
 		bool bHasUnLua = false;
