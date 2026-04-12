@@ -52,7 +52,20 @@ public:
 
 	/** 为 Blueprint 自动挂载 UnLuaInterface 并设置 GetModuleName */
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
-	static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
+static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
+static bool ResetBlueprintForRegeneration(
+	UBlueprint* Blueprint,
+	bool bClearGraphs = true,
+	bool bClearVariables = true);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static bool ResetAnimBlueprintForRegeneration(
+	class UAnimBlueprint* AnimBlueprint,
+	bool bClearVariables = true);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static bool SetupAnimStateMachineFromJson(
+	class UAnimBlueprint* AnimBlueprint,
+	const FString& DefinitionJson);
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
 	static bool SetupQuadrupedBeastStateMachine(
 		class UAnimBlueprint* AnimBlueprint,

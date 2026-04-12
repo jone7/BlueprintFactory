@@ -61,6 +61,9 @@ def generate_blueprint(json_path: str):
     output_path = template.get("OutputPath", "/Game/Blueprints/Generated/")
     components = template.get("Components", [])
     preserve_existing_components = template.get("PreserveExistingComponents", False)
+    reset_existing_asset = bool(template.get("ResetExistingAsset", not preserve_existing_components))
+    reset_existing_graphs = bool(template.get("ResetExistingGraphs", reset_existing_asset))
+    reset_existing_variables = bool(template.get("ResetExistingVariables", reset_existing_asset))
     unlua_binding = template.get("UnLuaBinding", "")
 
     if not IN_UE:
@@ -83,6 +86,21 @@ def generate_blueprint(json_path: str):
     asset_path = output_path + name
     bp = unreal.load_asset(asset_path)
     if bp and isinstance(bp, unreal.Blueprint):
+        if reset_existing_asset:
+            lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+            reset_func = None
+            if lib:
+                reset_func = getattr(lib, "reset_blueprint_for_regeneration", None)
+                if not callable(reset_func):
+                    reset_func = getattr(lib, "ResetBlueprintForRegeneration", None)
+            if callable(reset_func):
+                ok = bool(reset_func(bp, reset_existing_graphs, reset_existing_variables))
+                if ok:
+                    _log("  Cleared existing blueprint content before regeneration")
+                else:
+                    _log("  Failed to clear existing blueprint content, continuing with overwrite attempt")
+            else:
+                _log("  ResetBlueprintForRegeneration not available, continuing with overwrite attempt")
         _log(f"  蓝图已存在，更新模式: {asset_path}")
         if preserve_existing_components:
             _log("  保留现有组件，仅更新属性/绑定")

@@ -120,36 +120,79 @@ def _compile_blueprint(bp):
         _log(f"  Compile warning: {exc}")
 
 
-def _apply_quadruped_state_machine(bp, template):
-    setup = template.get("QuadrupedStateMachine")
+def _build_legacy_quadruped_definition(setup):
+    machine_name = str(setup.get("StateMachineName", "QuadrupedLocomotion") or "QuadrupedLocomotion")
+    return {
+        "StateMachineName": machine_name,
+        "EntryState": "Idle",
+        "DefaultCrossfade": 0.18,
+        "Variables": [
+            {"Name": "Speed", "Type": "float"},
+            {"Name": "Direction", "Type": "float"},
+            {"Name": "MoveAlpha", "Type": "float"},
+            {"Name": "IdleAlpha", "Type": "float"},
+            {"Name": "bIsMoving", "Type": "bool"},
+            {"Name": "bIsGrounded", "Type": "bool"},
+            {"Name": "bIsAirborne", "Type": "bool"},
+            {"Name": "bIsSitting", "Type": "bool"},
+            {"Name": "bIsSleeping", "Type": "bool"},
+            {"Name": "bIsSniffing", "Type": "bool"},
+            {"Name": "bIsAlert", "Type": "bool"},
+        ],
+        "States": [
+            {"Name": "Idle", "AnimationAsset": str(setup.get("IdleAnimationAsset", "") or ""), "NodePosition": {"X": 80, "Y": -80}},
+            {"Name": "Walk", "AnimationAsset": str(setup.get("WalkAnimationAsset", "") or ""), "NodePosition": {"X": 420, "Y": -80}},
+            {"Name": "Sit", "AnimationAsset": str(setup.get("SitAnimationAsset", "") or ""), "NodePosition": {"X": 80, "Y": 220}},
+            {"Name": "Sleep", "AnimationAsset": str(setup.get("SleepAnimationAsset", "") or ""), "NodePosition": {"X": -240, "Y": 220}},
+            {"Name": "Sniff", "AnimationAsset": str(setup.get("SniffAnimationAsset", "") or ""), "NodePosition": {"X": 420, "Y": 220}},
+        ],
+        "Transitions": [
+            {"From": "Idle", "To": "Walk", "Priority": 3, "Condition": {"Variable": "bIsMoving", "Value": True}},
+            {"From": "Walk", "To": "Idle", "Priority": 0, "Condition": {"Variable": "bIsMoving", "Value": False}},
+            {"From": "Idle", "To": "Sit", "Priority": 2, "Condition": {"Variable": "bIsSitting", "Value": True}},
+            {"From": "Sit", "To": "Idle", "Priority": 0, "Condition": {"Variable": "bIsSitting", "Value": False}},
+            {"From": "Idle", "To": "Sleep", "Priority": 0, "Condition": {"Variable": "bIsSleeping", "Value": True}},
+            {"From": "Sleep", "To": "Idle", "Priority": 0, "Condition": {"Variable": "bIsSleeping", "Value": False}},
+            {"From": "Idle", "To": "Sniff", "Priority": 1, "Condition": {"Variable": "bIsSniffing", "Value": True}},
+            {"From": "Sniff", "To": "Idle", "Priority": 0, "Condition": {"Variable": "bIsSniffing", "Value": False}},
+        ],
+    }
+
+
+def _resolve_state_machine_definition(template):
+    setup = template.get("StateMachineDefinition")
+    if isinstance(setup, dict):
+        return setup
+
+    legacy_setup = template.get("QuadrupedStateMachine")
+    if isinstance(legacy_setup, dict):
+        return _build_legacy_quadruped_definition(legacy_setup)
+
+    return None
+
+
+def _apply_state_machine_definition(bp, template):
+    setup = _resolve_state_machine_definition(template)
     if not isinstance(setup, dict):
         return
 
     lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
     if not lib:
-        _log("  Quadruped state machine skipped: missing BPFactoryBlueprintLibrary")
+        _log("  State machine skipped: missing BPFactoryBlueprintLibrary")
         return
 
-    func = getattr(lib, "setup_quadruped_beast_state_machine", None)
+    func = getattr(lib, "setup_anim_state_machine_from_json", None)
     if not callable(func):
-        func = getattr(lib, "SetupQuadrupedBeastStateMachine", None)
+        func = getattr(lib, "SetupAnimStateMachineFromJson", None)
     if not callable(func):
-        _log("  Quadruped state machine skipped: SetupQuadrupedBeastStateMachine not found")
+        _log("  State machine skipped: SetupAnimStateMachineFromJson not found")
         return
 
-    ok = bool(func(
-        bp,
-        str(setup.get("StateMachineName", "QuadrupedLocomotion") or "QuadrupedLocomotion"),
-        str(setup.get("IdleAnimationAsset", "") or ""),
-        str(setup.get("WalkAnimationAsset", "") or ""),
-        str(setup.get("SitAnimationAsset", "") or ""),
-        str(setup.get("SleepAnimationAsset", "") or ""),
-        str(setup.get("SniffAnimationAsset", "") or ""),
-    ))
+    ok = bool(func(bp, json.dumps(setup, ensure_ascii=False)))
     if ok:
-        _log("  Quadruped state machine applied")
+        _log("  State machine definition applied")
     else:
-        _log("  Quadruped state machine apply failed")
+        _log("  State machine definition apply failed")
 
 
 def generate_anim_blueprint(json_path: str):
@@ -168,6 +211,8 @@ def generate_anim_blueprint(json_path: str):
     preview_mesh_path = template.get("PreviewSkeletalMesh", "")
     unlua_binding = template.get("UnLuaBinding", "")
     is_template = bool(template.get("bTemplate", False))
+    reset_existing_asset = bool(template.get("ResetExistingAsset", False))
+    reset_existing_variables = bool(template.get("ResetExistingVariables", reset_existing_asset))
 
     if not IN_UE:
         _log(f"Non-UE environment, skipping generation: {name}")
@@ -180,9 +225,24 @@ def generate_anim_blueprint(json_path: str):
             _log_error(f"Existing asset is not an AnimBlueprint: {asset_path}")
             return False
         _log(f"AnimBlueprint already exists, reusing: {asset_path}")
+        if reset_existing_asset:
+            lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+            reset_func = None
+            if lib:
+                reset_func = getattr(lib, "reset_anim_blueprint_for_regeneration", None)
+                if not callable(reset_func):
+                    reset_func = getattr(lib, "ResetAnimBlueprintForRegeneration", None)
+            if callable(reset_func):
+                ok = bool(reset_func(existing, reset_existing_variables))
+                if ok:
+                    _log("  Cleared existing AnimBlueprint content before regeneration")
+                else:
+                    _log("  Failed to clear existing AnimBlueprint content, continuing with overwrite attempt")
+            else:
+                _log("  ResetAnimBlueprintForRegeneration not available, continuing with overwrite attempt")
+        _apply_state_machine_definition(existing, template)
         if unlua_binding:
             _set_unlua_binding(existing, unlua_binding)
-        _apply_quadruped_state_machine(existing, template)
         _compile_blueprint(existing)
         unreal.EditorAssetLibrary.save_asset(asset_path)
         return True
@@ -222,9 +282,9 @@ def generate_anim_blueprint(json_path: str):
         _log_error(f"Failed to create AnimBlueprint: {asset_path}")
         return False
 
+    _apply_state_machine_definition(anim_bp, template)
     if unlua_binding:
         _set_unlua_binding(anim_bp, unlua_binding)
-    _apply_quadruped_state_machine(anim_bp, template)
 
     _compile_blueprint(anim_bp)
     unreal.EditorAssetLibrary.save_asset(asset_path)
