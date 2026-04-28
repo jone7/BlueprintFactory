@@ -62,6 +62,7 @@ def generate_blueprint(json_path: str):
     components = template.get("Components", [])
     preserve_existing_components = template.get("PreserveExistingComponents", False)
     reset_existing_asset = bool(template.get("ResetExistingAsset", not preserve_existing_components))
+    recreate_existing_asset = bool(template.get("RecreateExistingAsset", reset_existing_asset and not preserve_existing_components))
     reset_existing_graphs = bool(template.get("ResetExistingGraphs", reset_existing_asset))
     reset_existing_variables = bool(template.get("ResetExistingVariables", reset_existing_asset))
     unlua_binding = template.get("UnLuaBinding", "")
@@ -86,45 +87,61 @@ def generate_blueprint(json_path: str):
     asset_path = output_path + name
     bp = unreal.load_asset(asset_path)
     if bp and isinstance(bp, unreal.Blueprint):
-        if reset_existing_asset:
-            lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
-            reset_func = None
-            if lib:
-                reset_func = getattr(lib, "reset_blueprint_for_regeneration", None)
-                if not callable(reset_func):
-                    reset_func = getattr(lib, "ResetBlueprintForRegeneration", None)
-            if callable(reset_func):
-                ok = bool(reset_func(bp, reset_existing_graphs, reset_existing_variables))
-                if ok:
-                    _log("  Cleared existing blueprint content before regeneration")
-                else:
-                    _log("  Failed to clear existing blueprint content, continuing with overwrite attempt")
-            else:
-                _log("  ResetBlueprintForRegeneration not available, continuing with overwrite attempt")
-        _log(f"  蓝图已存在，更新模式: {asset_path}")
-        if preserve_existing_components:
-            _log("  保留现有组件，仅更新属性/绑定")
+        if recreate_existing_asset and not preserve_existing_components:
+            deleted = False
+            try:
+                deleted = bool(unreal.EditorAssetLibrary.delete_asset(asset_path))
+            except Exception:
+                deleted = False
+
+            if not deleted:
+                _log_error(f"删除已有蓝图失败，无法安全重建: {asset_path}")
+                return False
+
+            _log(f"  已删除旧蓝图，准备重建: {asset_path}")
+            bp = None
         else:
-            # 清除旧组件（保留 DefaultSceneRoot）
-            subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
-            bfl = unreal.SubobjectDataBlueprintFunctionLibrary
-            old_handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
-            if old_handles and len(old_handles) > 1:
-                # 跳过第一个（root），删除其余
-                for h in old_handles[1:]:
-                    # UE 5.7: get_object_for_handle 移到 SubobjectDataSubsystem
-                    obj = None
-                    try:
-                        obj = bfl.get_object_for_handle(h)
-                    except AttributeError:
+            reset_succeeded = False
+            if reset_existing_asset:
+                lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+                reset_func = None
+                if lib:
+                    reset_func = getattr(lib, "reset_blueprint_for_regeneration", None)
+                    if not callable(reset_func):
+                        reset_func = getattr(lib, "ResetBlueprintForRegeneration", None)
+                if callable(reset_func):
+                    reset_succeeded = bool(reset_func(bp, reset_existing_graphs, reset_existing_variables))
+                    if reset_succeeded:
+                        _log("  Cleared existing blueprint content before regeneration")
+                    else:
+                        _log("  Failed to clear existing blueprint content, continuing with overwrite attempt")
+                else:
+                    _log("  ResetBlueprintForRegeneration not available, continuing with overwrite attempt")
+            _log(f"  蓝图已存在，更新模式: {asset_path}")
+            if preserve_existing_components:
+                _log("  保留现有组件，仅更新属性/绑定")
+            elif not reset_succeeded:
+                # 清除旧组件（保留 DefaultSceneRoot）
+                subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+                bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+                old_handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+                if old_handles and len(old_handles) > 1:
+                    # 跳过第一个（root），删除其余
+                    for h in old_handles[1:]:
+                        # UE 5.7: get_object_for_handle 移到 SubobjectDataSubsystem
+                        obj = None
                         try:
-                            obj = subsystem.get_object_for_handle(h)
-                        except Exception:
-                            pass
-                    if obj and obj.get_name() != "DefaultSceneRoot":
-                        subsystem.delete_subobject_from_blueprint(h, bp)
-                _log(f"  已清除旧组件")
-    else:
+                            obj = bfl.get_object_for_handle(h)
+                        except AttributeError:
+                            try:
+                                obj = subsystem.get_object_for_handle(h)
+                            except Exception:
+                                pass
+                        if obj and obj.get_name() != "DefaultSceneRoot":
+                            subsystem.delete_subobject_from_blueprint(h, bp)
+                    _log(f"  已清除旧组件")
+
+    if not (bp and isinstance(bp, unreal.Blueprint)):
         # 创建新蓝图资产
         factory = unreal.BlueprintFactory()
         factory.set_editor_property("ParentClass", parent_class)
@@ -151,25 +168,41 @@ def generate_blueprint(json_path: str):
 
     # 找到或创建 Scene root handle（用于挂载子组件）
     scene_root_handle = root_handle
+    component_handles = {}
 
     for comp_data in components:
         comp_type = comp_data.get("Type", "SceneComponent")
         comp_name = comp_data.get("Name", "NewComponent")
+        parent_name = str(comp_data.get("Parent", "") or "")
+        wants_root = bool(comp_data.get("IsRoot", False)) or (comp_type == "SceneComponent" and comp_name == "Root")
 
-        if comp_type == "SceneComponent" and comp_name == "Root":
-            # 跳过 Root SceneComponent，使用默认的 DefaultSceneRoot
-            continue
+        parent_handle = None
+        if parent_name:
+            parent_handle = component_handles.get(parent_name)
+            if parent_handle is None:
+                parent_handle = _find_subobject_handle_by_name(bp, parent_name)
+        if parent_handle is None:
+            parent_handle = scene_root_handle
 
         if preserve_existing_components:
             existing_comp = _find_existing_component_template(bp, comp_name)
             if existing_comp:
                 _set_component_properties(existing_comp, comp_type, comp_data)
                 _log(f"  Updated existing component: {comp_name} ({comp_type})")
+                existing_handle = _find_subobject_handle_by_name(bp, comp_name)
+                if existing_handle is not None:
+                    component_handles[comp_name] = existing_handle
+                    if wants_root:
+                        scene_root_handle = existing_handle
                 continue
 
-        result = _add_component_v2(bp, subsystem, bfl, scene_root_handle, comp_data)
+        result = _add_component_v2(bp, subsystem, bfl, parent_handle, comp_data)
         if result is None:
             _log(f"  组件添加失败: {comp_name}")
+            continue
+        component_handles[comp_name] = result
+        if wants_root:
+            scene_root_handle = result
 
     # UnLua 绑定
     if unlua_binding:
@@ -256,10 +289,375 @@ COMPONENT_TYPE_ALIASES = {
     "SplineMesh": "SplineMeshComponent",
 }
 
+EXPORT_COMPONENT_TYPE_MAP = {
+    "StaticMeshComponent": "StaticMesh",
+    "SkeletalMeshComponent": "SkeletalMesh",
+    "BoxComponent": "BoxCollision",
+    "SphereComponent": "SphereCollision",
+    "CapsuleComponent": "CapsuleCollision",
+    "PointLightComponent": "PointLight",
+    "SpotLightComponent": "SpotLight",
+    "ParticleSystemComponent": "ParticleSystem",
+    "AudioComponent": "Audio",
+    "ArrowComponent": "Arrow",
+    "BillboardComponent": "Billboard",
+    "SplineComponent": "Spline",
+    "SplineMeshComponent": "SplineMesh",
+    "SceneComponent": "SceneComponent",
+}
+
 # 需要特殊属性设置的组件类型
-_COMP_RESERVED_FIELDS = {"Type", "Name", "Mesh", "Material", "Location", "Rotation", "Scale",
+_COMP_RESERVED_FIELDS = {"Type", "Name", "Parent", "IsRoot", "Mesh", "Material", "Location", "Rotation", "Scale",
                           "Points", "Extent", "Radius", "HalfHeight", "AnimationMode", "AnimClass",
                           "AnimToPlay", "AnimationAsset"}
+
+_EXPORTED_COMPONENT_FIELDS = {
+    "Type", "Name", "Parent", "IsRoot", "Mesh", "Material",
+    "Location", "Rotation", "Scale",
+    "Extent", "Radius", "HalfHeight",
+    "CollisionProfileName", "bCanEverAffectNavigation", "bDynamicObstacle",
+    "AnimationMode", "AnimClass", "AnimToPlay", "AnimationAsset",
+}
+
+
+def _safe_get_editor_property(obj, prop_name, default=None):
+    if obj is None or not prop_name:
+        return default
+    try:
+        return obj.get_editor_property(prop_name)
+    except Exception:
+        return default
+
+
+def _load_existing_template(json_path):
+    if not json_path or not os.path.isfile(json_path):
+        return {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        _log(f"读取已有模板失败，将改为全量导出: {exc}")
+        return {}
+
+
+def _normalize_component_type_for_export(comp):
+    if comp is None:
+        return "SceneComponent"
+    class_name = comp.get_class().get_name()
+    mapped = EXPORT_COMPONENT_TYPE_MAP.get(class_name)
+    if mapped:
+        return mapped
+    if class_name.endswith("Component"):
+        return class_name[:-9]
+    return class_name
+
+
+def _vector_to_list(vec):
+    if vec is None:
+        return None
+    return [float(vec.x), float(vec.y), float(vec.z)]
+
+
+def _rotator_to_list(rot):
+    if rot is None:
+        return None
+    return [float(rot.pitch), float(rot.yaw), float(rot.roll)]
+
+
+def _is_close(a, b, epsilon=0.001):
+    return abs(float(a) - float(b)) <= epsilon
+
+
+def _is_vector_close(values, expected, epsilon=0.001):
+    if values is None or len(values) != len(expected):
+        return False
+    for idx, expected_value in enumerate(expected):
+        if not _is_close(values[idx], expected_value, epsilon):
+            return False
+    return True
+
+
+def _merge_component_export(existing_comp, exported_comp):
+    merged = {}
+    if isinstance(existing_comp, dict):
+        merged.update(existing_comp)
+        for field_name in _EXPORTED_COMPONENT_FIELDS:
+            merged.pop(field_name, None)
+    merged.update(exported_comp)
+    return merged
+
+
+def _extract_parent_name(node):
+    parent_name = _safe_get_editor_property(node, "ParentComponentOrVariableName", "")
+    if parent_name is None:
+        return ""
+    parent_name = str(parent_name)
+    if parent_name in ("None", "None.None", ""):
+        return ""
+    return parent_name.split(".")[-1]
+
+
+def _export_component_data(node, component_name_to_root):
+    comp = _safe_get_editor_property(node, "ComponentTemplate")
+    if comp is None:
+        return None
+
+    comp_name = comp.get_name()
+    comp_type = _normalize_component_type_for_export(comp)
+    comp_data = {
+        "Type": comp_type,
+        "Name": comp_name,
+    }
+
+    parent_name = _extract_parent_name(node)
+    if parent_name:
+        comp_data["Parent"] = parent_name
+
+    if component_name_to_root.get(comp_name, False):
+        comp_data["IsRoot"] = True
+
+    rel_loc = _vector_to_list(_safe_get_editor_property(comp, "RelativeLocation"))
+    if rel_loc and not _is_vector_close(rel_loc, [0.0, 0.0, 0.0]):
+        comp_data["Location"] = rel_loc
+
+    rel_rot = _rotator_to_list(_safe_get_editor_property(comp, "RelativeRotation"))
+    if rel_rot and not _is_vector_close(rel_rot, [0.0, 0.0, 0.0]):
+        comp_data["Rotation"] = rel_rot
+
+    rel_scale = _vector_to_list(_safe_get_editor_property(comp, "RelativeScale3D"))
+    if rel_scale and not _is_vector_close(rel_scale, [1.0, 1.0, 1.0]):
+        comp_data["Scale"] = rel_scale
+
+    collision_profile = _safe_get_editor_property(comp, "CollisionProfileName")
+    if comp_type != "SceneComponent" and collision_profile not in (None, "", "None"):
+        comp_data["CollisionProfileName"] = str(collision_profile)
+
+    can_affect_nav = _safe_get_editor_property(comp, "bCanEverAffectNavigation", None)
+    if can_affect_nav is not None and (bool(can_affect_nav) or comp_type != "SceneComponent"):
+        comp_data["bCanEverAffectNavigation"] = bool(can_affect_nav)
+
+    dynamic_obstacle = _safe_get_editor_property(comp, "bDynamicObstacle", None)
+    if dynamic_obstacle is not None and bool(dynamic_obstacle):
+        comp_data["bDynamicObstacle"] = bool(dynamic_obstacle)
+
+    if isinstance(comp, unreal.StaticMeshComponent):
+        mesh = _safe_get_editor_property(comp, "StaticMesh")
+        if mesh:
+            comp_data["Mesh"] = mesh.get_path_name()
+        material = None
+        try:
+            material = comp.get_material(0)
+        except Exception:
+            material = None
+        if material:
+            comp_data["Material"] = material.get_path_name()
+
+    if isinstance(comp, unreal.SkeletalMeshComponent):
+        mesh = _safe_get_editor_property(comp, "SkeletalMeshAsset")
+        if mesh:
+            comp_data["Mesh"] = mesh.get_path_name()
+
+        anim_mode = _safe_get_editor_property(comp, "AnimationMode")
+        if anim_mode is not None:
+            comp_data["AnimationMode"] = str(anim_mode).split(".")[-1]
+
+        anim_class = _safe_get_editor_property(comp, "AnimClass")
+        if anim_class:
+            comp_data["AnimClass"] = anim_class.get_path_name()
+
+        anim_to_play = _safe_get_editor_property(comp, "AnimToPlay")
+        if anim_to_play:
+            comp_data["AnimToPlay"] = anim_to_play.get_path_name()
+
+    if isinstance(comp, unreal.BoxComponent):
+        ext = _safe_get_editor_property(comp, "BoxExtent")
+        if ext:
+            comp_data["Extent"] = _vector_to_list(ext)
+
+    if isinstance(comp, unreal.SphereComponent):
+        radius = _safe_get_editor_property(comp, "SphereRadius")
+        if radius is not None:
+            comp_data["Radius"] = float(radius)
+
+    if isinstance(comp, unreal.CapsuleComponent):
+        radius = _safe_get_editor_property(comp, "CapsuleRadius")
+        half_height = _safe_get_editor_property(comp, "CapsuleHalfHeight")
+        if radius is not None:
+            comp_data["Radius"] = float(radius)
+        if half_height is not None:
+            comp_data["HalfHeight"] = float(half_height)
+
+    return comp_data
+
+
+def _get_component_object_from_data(bp, bfl, data):
+    comp = None
+    try:
+        comp = bfl.get_object_for_blueprint(data, bp)
+    except Exception:
+        comp = None
+    if comp is None:
+        try:
+            comp = bfl.get_associated_object(data)
+        except Exception:
+            comp = None
+    return comp
+
+
+def _get_component_name_from_data(bp, bfl, data):
+    comp_name = ""
+    try:
+        comp_name = str(bfl.get_variable_name(data))
+    except Exception:
+        comp_name = ""
+    if comp_name and comp_name not in ("None", "None.None"):
+        return comp_name
+
+    comp = _get_component_object_from_data(bp, bfl, data)
+    if comp is not None:
+        return comp.get_name()
+    return ""
+
+
+def _extract_parent_name_from_data(bp, bfl, data):
+    parent_handle = None
+    try:
+        parent_handle = bfl.get_parent_handle(data)
+    except Exception:
+        parent_handle = None
+
+    if not parent_handle:
+        try:
+            parent_handle = data.get_parent_handle()
+        except Exception:
+            parent_handle = None
+
+    if not parent_handle:
+        return ""
+
+    try:
+        parent_data = bfl.get_data(parent_handle)
+    except Exception:
+        parent_data = None
+
+    if not parent_data:
+        return ""
+
+    try:
+        if not bfl.is_component(parent_data):
+            return ""
+    except Exception:
+        pass
+
+    return _get_component_name_from_data(bp, bfl, parent_data)
+
+
+def _is_root_component_data(data, bfl):
+    try:
+        return bool(bfl.is_root_component(data))
+    except Exception:
+        try:
+            return bool(data.is_root_component())
+        except Exception:
+            return False
+
+
+def _export_component_data_from_subobject(bp, bfl, data):
+    comp = _get_component_object_from_data(bp, bfl, data)
+    if comp is None:
+        return None
+
+    comp_name = _get_component_name_from_data(bp, bfl, data)
+    if not comp_name:
+        return None
+
+    comp_type = _normalize_component_type_for_export(comp)
+    comp_data = {
+        "Type": comp_type,
+        "Name": comp_name,
+    }
+
+    parent_name = _extract_parent_name_from_data(bp, bfl, data)
+    if parent_name:
+        comp_data["Parent"] = parent_name
+
+    if _is_root_component_data(data, bfl):
+        comp_data["IsRoot"] = True
+
+    rel_loc = _vector_to_list(_safe_get_editor_property(comp, "RelativeLocation"))
+    if rel_loc and not _is_vector_close(rel_loc, [0.0, 0.0, 0.0]):
+        comp_data["Location"] = rel_loc
+
+    rel_rot = _rotator_to_list(_safe_get_editor_property(comp, "RelativeRotation"))
+    if rel_rot and not _is_vector_close(rel_rot, [0.0, 0.0, 0.0]):
+        comp_data["Rotation"] = rel_rot
+
+    rel_scale = _vector_to_list(_safe_get_editor_property(comp, "RelativeScale3D"))
+    if rel_scale and not _is_vector_close(rel_scale, [1.0, 1.0, 1.0]):
+        comp_data["Scale"] = rel_scale
+
+    collision_profile = _safe_get_editor_property(comp, "CollisionProfileName")
+    if comp_type != "SceneComponent" and collision_profile not in (None, "", "None"):
+        comp_data["CollisionProfileName"] = str(collision_profile)
+
+    can_affect_nav = _safe_get_editor_property(comp, "bCanEverAffectNavigation", None)
+    if can_affect_nav is not None and (bool(can_affect_nav) or comp_type != "SceneComponent"):
+        comp_data["bCanEverAffectNavigation"] = bool(can_affect_nav)
+
+    dynamic_obstacle = _safe_get_editor_property(comp, "bDynamicObstacle", None)
+    if dynamic_obstacle is not None and bool(dynamic_obstacle):
+        comp_data["bDynamicObstacle"] = bool(dynamic_obstacle)
+
+    if isinstance(comp, unreal.StaticMeshComponent):
+        mesh = _safe_get_editor_property(comp, "StaticMesh")
+        if mesh:
+            comp_data["Mesh"] = mesh.get_path_name()
+
+        material = None
+        try:
+            material = comp.get_material(0)
+        except Exception:
+            material = None
+        if material:
+            comp_data["Material"] = material.get_path_name()
+
+    if isinstance(comp, unreal.SkeletalMeshComponent):
+        mesh = _safe_get_editor_property(comp, "SkeletalMeshAsset")
+        if mesh:
+            comp_data["Mesh"] = mesh.get_path_name()
+
+        anim_mode = _safe_get_editor_property(comp, "AnimationMode")
+        if anim_mode is not None:
+            comp_data["AnimationMode"] = str(anim_mode).split(".")[-1]
+
+        anim_class = _safe_get_editor_property(comp, "AnimClass")
+        if anim_class:
+            comp_data["AnimClass"] = anim_class.get_path_name()
+
+        anim_to_play = _safe_get_editor_property(comp, "AnimToPlay")
+        if anim_to_play:
+            comp_data["AnimToPlay"] = anim_to_play.get_path_name()
+
+    if isinstance(comp, unreal.BoxComponent):
+        ext = _safe_get_editor_property(comp, "BoxExtent")
+        if ext:
+            comp_data["Extent"] = _vector_to_list(ext)
+
+    if isinstance(comp, unreal.SphereComponent):
+        radius = _safe_get_editor_property(comp, "SphereRadius")
+        if radius is not None:
+            comp_data["Radius"] = float(radius)
+
+    if isinstance(comp, unreal.CapsuleComponent):
+        radius = _safe_get_editor_property(comp, "CapsuleRadius")
+        half_height = _safe_get_editor_property(comp, "CapsuleHalfHeight")
+        if radius is not None:
+            comp_data["Radius"] = float(radius)
+        if half_height is not None:
+            comp_data["HalfHeight"] = float(half_height)
+
+    return comp_data
 
 
 def _find_existing_component_template(bp, comp_name):
@@ -316,6 +714,48 @@ def _find_existing_component_template(bp, comp_name):
 
                 if variable_name == comp_name or comp.get_name() == comp_name:
                     return comp
+    except Exception:
+        pass
+
+    return None
+
+
+def _find_subobject_handle_by_name(bp, comp_name):
+    if not IN_UE or not bp or not comp_name:
+        return None
+
+    try:
+        subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+        if subsystem and bfl:
+            handles = subsystem.k2_gather_subobject_data_for_blueprint(bp)
+            for handle in handles:
+                try:
+                    data = bfl.get_data(handle)
+                except Exception:
+                    data = None
+
+                if not data or not bfl.is_component(data):
+                    continue
+
+                variable_name = ""
+                try:
+                    variable_name = str(bfl.get_variable_name(data))
+                except Exception:
+                    variable_name = ""
+
+                comp = None
+                try:
+                    comp = bfl.get_object_for_blueprint(data, bp)
+                except Exception:
+                    try:
+                        comp = bfl.get_associated_object(data)
+                    except Exception:
+                        comp = None
+
+                comp_object_name = comp.get_name() if comp else ""
+                if variable_name == comp_name or comp_object_name == comp_name:
+                    return handle
     except Exception:
         pass
 
@@ -682,54 +1122,120 @@ def export_blueprint(asset_path: str, json_path: str):
         return False
 
     _log(f"导出蓝图: {asset_path}")
-
-    template = {
-        "Name": bp.get_name(),
-        "ParentClass": "",
-        "OutputPath": str(asset_path).rsplit("/", 1)[0] + "/",
-        "Components": [],
-        "UnLuaBinding": "",
-    }
+    existing_template = _load_existing_template(json_path)
+    template = dict(existing_template) if isinstance(existing_template, dict) else {}
+    template["Name"] = bp.get_name()
+    template["ParentClass"] = ""
+    template["OutputPath"] = str(asset_path).rsplit("/", 1)[0] + "/"
+    if "Components" not in template:
+        template["Components"] = []
+    if "UnLuaBinding" not in template:
+        template["UnLuaBinding"] = ""
 
     # 父类
-    parent = bp.get_editor_property("ParentClass")
-    if parent:
-        parent_path = parent.get_path_name()
-        # 反查简写
+    parent_path = str(template.get("ParentClass", "") or "")
+    parent_obj = None
+    try:
+        parent_obj = bp.get_editor_property("ParentClass")
+    except Exception:
+        parent_obj = None
+
+    if parent_obj is None:
+        generated_class = None
+        try:
+            generated_class = bp.generated_class()
+        except Exception:
+            try:
+                generated_class = bp.generated_class
+            except Exception:
+                generated_class = None
+
+        if generated_class is not None:
+            try:
+                parent_obj = generated_class.get_super_class()
+            except Exception:
+                try:
+                    parent_obj = generated_class.get_super_struct()
+                except Exception:
+                    parent_obj = None
+
+    if parent_obj:
+        try:
+            parent_path = parent_obj.get_path_name()
+        except Exception:
+            parent_path = str(parent_obj)
+
+    if parent_path:
         for short, full in PARENT_CLASS_MAP.items():
             if full in parent_path:
                 parent_path = short
                 break
         template["ParentClass"] = parent_path
+    elif not template.get("ParentClass"):
+        template["ParentClass"] = "Actor"
 
     # 组件
-    scs = bp.get_editor_property("SimpleConstructionScript")
-    if scs:
-        nodes = scs.get_all_nodes()
-        for node in nodes:
-            comp = node.get_editor_property("ComponentTemplate")
-            if comp:
-                comp_data = {
-                    "Type": comp.get_class().get_name().replace("Component", ""),
-                    "Name": comp.get_name(),
-                }
+    existing_components = template.get("Components", [])
+    existing_by_name = {}
+    if isinstance(existing_components, list):
+        for existing_comp in existing_components:
+            if isinstance(existing_comp, dict) and existing_comp.get("Name"):
+                existing_by_name[existing_comp.get("Name")] = existing_comp
 
-                # StaticMesh
-                if isinstance(comp, unreal.StaticMeshComponent):
-                    mesh = comp.get_editor_property("StaticMesh")
-                    if mesh:
-                        comp_data["Mesh"] = mesh.get_path_name()
+    exported_components = []
+    exported_names = set()
+    subsystem = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+    bfl = unreal.SubobjectDataBlueprintFunctionLibrary
+    handles = subsystem.k2_gather_subobject_data_for_blueprint(bp) if subsystem and bfl else []
+    for handle in handles or []:
+        try:
+            data = bfl.get_data(handle)
+        except Exception:
+            data = None
+        if not data:
+            continue
 
-                # BoxComponent
-                if isinstance(comp, unreal.BoxComponent):
-                    ext = comp.get_editor_property("BoxExtent")
-                    comp_data["Extent"] = [ext.x, ext.y, ext.z]
+        try:
+            if not bfl.is_component(data):
+                continue
+        except Exception:
+            continue
 
-                # SphereComponent
-                if isinstance(comp, unreal.SphereComponent):
-                    comp_data["Radius"] = comp.get_editor_property("SphereRadius")
+        comp_data = _export_component_data_from_subobject(bp, bfl, data)
+        if not comp_data:
+            continue
+        comp_name = comp_data.get("Name")
+        if comp_name in exported_names:
+            continue
+        exported_names.add(comp_name)
 
-                template["Components"].append(comp_data)
+        exported_components.append(
+            _merge_component_export(existing_by_name.get(comp_name), comp_data)
+        )
+
+    ordered_components = []
+    emitted_names = set()
+    remaining_components = list(exported_components)
+
+    while remaining_components:
+        next_remaining = []
+        progress_made = False
+        for comp_data in remaining_components:
+            parent_name = str(comp_data.get("Parent", "") or "")
+            if not parent_name or parent_name in emitted_names or bool(comp_data.get("IsRoot", False)):
+                ordered_components.append(comp_data)
+                emitted_names.add(comp_data.get("Name"))
+                progress_made = True
+            else:
+                next_remaining.append(comp_data)
+
+        if not progress_made:
+            ordered_components.extend(next_remaining)
+            break
+
+        remaining_components = next_remaining
+
+    template["Components"] = ordered_components
 
     # 写入 JSON
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
