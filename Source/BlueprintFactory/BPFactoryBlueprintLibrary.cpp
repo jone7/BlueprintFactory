@@ -3,6 +3,7 @@
 #include "Animation/AnimationAsset.h"
 #include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_SequencePlayer.h"
+#include "AnimGraphNode_Slot.h"
 #include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateMachineBase.h"
@@ -25,6 +26,7 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphSchema_K2.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CommutativeAssociativeBinaryOperator.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_VariableGet.h"
@@ -43,6 +45,22 @@
 namespace
 {
 	constexpr float DefaultCrossfade = 0.18f;
+
+	enum class EAnimTransitionConditionType : uint8
+	{
+		Bool,
+		NumericComparison
+	};
+
+	enum class EAnimTransitionComparisonOp : uint8
+	{
+		Equal,
+		NotEqual,
+		Greater,
+		GreaterOrEqual,
+		Less,
+		LessOrEqual
+	};
 
 	struct FAnimStateMachineVariableSpec
 	{
@@ -65,15 +83,26 @@ namespace
 		bool bExpectedValue = true;
 		int32 Priority = 0;
 		float CrossfadeDuration = DefaultCrossfade;
+		EAnimTransitionConditionType ConditionType = EAnimTransitionConditionType::Bool;
+		EAnimTransitionComparisonOp ComparisonOp = EAnimTransitionComparisonOp::Equal;
+		double NumericValue = 0.0;
 	};
 
 	struct FAnimStateMachineDefinition
 	{
 		FName StateMachineName = TEXT("StateMachine");
 		FName EntryState;
+		FName OutputSlotName;
+		bool bAlwaysUpdateSourcePose = false;
 		TArray<FAnimStateMachineVariableSpec> Variables;
 		TArray<FAnimStateMachineStateSpec> States;
 		TArray<FAnimStateMachineTransitionSpec> Transitions;
+	};
+
+	struct FAnimAssetOverrideSpec
+	{
+		FName StateName;
+		FString AnimationAssetPath;
 	};
 
 	FString ToObjectPath(const FString& AssetPath)
@@ -149,6 +178,14 @@ namespace
 		return PinType;
 	}
 
+	FEdGraphPinType MakeDoublePinType()
+	{
+		FEdGraphPinType PinType;
+		PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+		return PinType;
+	}
+
 	bool TryMakePinTypeFromString(const FString& TypeName, FEdGraphPinType& OutPinType)
 	{
 		const FString Normalized = TypeName.TrimStartAndEnd().ToLower();
@@ -164,7 +201,89 @@ namespace
 			return true;
 		}
 
+		if (Normalized == TEXT("double") || Normalized == TEXT("real"))
+		{
+			OutPinType = MakeDoublePinType();
+			return true;
+		}
+
 		return false;
+	}
+
+	FString ExportPinTypeName(const FEdGraphPinType& PinType)
+	{
+		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+		{
+			return TEXT("bool");
+		}
+
+		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Real)
+		{
+			if (PinType.PinSubCategory == UEdGraphSchema_K2::PC_Double)
+			{
+				return TEXT("double");
+			}
+			return TEXT("float");
+		}
+
+		return FString();
+	}
+
+	bool TryParseTransitionComparisonOp(const FString& OperatorName, EAnimTransitionComparisonOp& OutOp)
+	{
+		const FString Normalized = OperatorName.TrimStartAndEnd().ToLower();
+		if (Normalized.IsEmpty() || Normalized == TEXT("equal") || Normalized == TEXT("equals"))
+		{
+			OutOp = EAnimTransitionComparisonOp::Equal;
+			return true;
+		}
+		if (Normalized == TEXT("notequal") || Normalized == TEXT("not_equal") || Normalized == TEXT("!="))
+		{
+			OutOp = EAnimTransitionComparisonOp::NotEqual;
+			return true;
+		}
+		if (Normalized == TEXT("greater") || Normalized == TEXT(">"))
+		{
+			OutOp = EAnimTransitionComparisonOp::Greater;
+			return true;
+		}
+		if (Normalized == TEXT("greaterorequal") || Normalized == TEXT("greater_or_equal") || Normalized == TEXT(">="))
+		{
+			OutOp = EAnimTransitionComparisonOp::GreaterOrEqual;
+			return true;
+		}
+		if (Normalized == TEXT("less") || Normalized == TEXT("<"))
+		{
+			OutOp = EAnimTransitionComparisonOp::Less;
+			return true;
+		}
+		if (Normalized == TEXT("lessorequal") || Normalized == TEXT("less_or_equal") || Normalized == TEXT("<="))
+		{
+			OutOp = EAnimTransitionComparisonOp::LessOrEqual;
+			return true;
+		}
+		return false;
+	}
+
+	FString TransitionComparisonOpToString(const EAnimTransitionComparisonOp ComparisonOp)
+	{
+		switch (ComparisonOp)
+		{
+		case EAnimTransitionComparisonOp::Equal:
+			return TEXT("Equal");
+		case EAnimTransitionComparisonOp::NotEqual:
+			return TEXT("NotEqual");
+		case EAnimTransitionComparisonOp::Greater:
+			return TEXT("Greater");
+		case EAnimTransitionComparisonOp::GreaterOrEqual:
+			return TEXT("GreaterOrEqual");
+		case EAnimTransitionComparisonOp::Less:
+			return TEXT("Less");
+		case EAnimTransitionComparisonOp::LessOrEqual:
+			return TEXT("LessOrEqual");
+		default:
+			return TEXT("Equal");
+		}
 	}
 
 	void EnsureMemberVariable(UBlueprint* Blueprint, const FName VarName, const FEdGraphPinType& PinType)
@@ -278,6 +397,19 @@ namespace
 			OutDefinition.EntryState = FName(*EntryState);
 		}
 
+		FString OutputSlotName;
+		RootObject->TryGetStringField(TEXT("OutputSlotName"), OutputSlotName);
+		if (!OutputSlotName.IsEmpty())
+		{
+			OutDefinition.OutputSlotName = FName(*OutputSlotName);
+		}
+
+		bool bAlwaysUpdateSourcePose = false;
+		if (RootObject->TryGetBoolField(TEXT("AlwaysUpdateSourcePose"), bAlwaysUpdateSourcePose))
+		{
+			OutDefinition.bAlwaysUpdateSourcePose = bAlwaysUpdateSourcePose;
+		}
+
 		if (const TArray<TSharedPtr<FJsonValue>>* VariablesArray = nullptr; RootObject->TryGetArrayField(TEXT("Variables"), VariablesArray) && VariablesArray)
 		{
 			for (const TSharedPtr<FJsonValue>& Value : *VariablesArray)
@@ -371,10 +503,45 @@ namespace
 					{
 						TransitionSpec.ConditionVariable = FName(*Variable);
 					}
-					bool bExpectedValue = true;
-					if ((*ConditionObject)->TryGetBoolField(TEXT("Value"), bExpectedValue))
+
+					FString OperatorName;
+					(*ConditionObject)->TryGetStringField(TEXT("Operator"), OperatorName);
+					const FString NormalizedOperator = OperatorName.TrimStartAndEnd().ToLower();
+
+					double NumericValue = 0.0;
+					if (!NormalizedOperator.IsEmpty()
+						&& NormalizedOperator != TEXT("notbool")
+						&& NormalizedOperator != TEXT("not_bool")
+						&& (*ConditionObject)->TryGetNumberField(TEXT("Value"), NumericValue))
 					{
-						TransitionSpec.bExpectedValue = bExpectedValue;
+						TransitionSpec.ConditionType = EAnimTransitionConditionType::NumericComparison;
+						TransitionSpec.NumericValue = NumericValue;
+						if (!TryParseTransitionComparisonOp(OperatorName, TransitionSpec.ComparisonOp))
+						{
+							TransitionSpec.ComparisonOp = EAnimTransitionComparisonOp::Equal;
+						}
+					}
+					else
+					{
+						bool bExpectedValue = true;
+						if ((*ConditionObject)->TryGetBoolField(TEXT("Value"), bExpectedValue))
+						{
+							TransitionSpec.ConditionType = EAnimTransitionConditionType::Bool;
+							TransitionSpec.bExpectedValue = bExpectedValue;
+							if (NormalizedOperator == TEXT("notbool") || NormalizedOperator == TEXT("not_bool"))
+							{
+								TransitionSpec.bExpectedValue = false;
+							}
+						}
+						else if ((*ConditionObject)->TryGetNumberField(TEXT("Value"), NumericValue))
+						{
+							TransitionSpec.ConditionType = EAnimTransitionConditionType::NumericComparison;
+							TransitionSpec.NumericValue = NumericValue;
+							if (!TryParseTransitionComparisonOp(OperatorName, TransitionSpec.ComparisonOp))
+							{
+								TransitionSpec.ComparisonOp = EAnimTransitionComparisonOp::Equal;
+							}
+						}
 					}
 				}
 				else
@@ -402,6 +569,49 @@ namespace
 		}
 
 		return OutDefinition.States.Num() > 0 && !OutDefinition.EntryState.IsNone();
+	}
+
+	bool ParseAnimationOverridesJson(const FString& OverridesJson, TArray<FAnimAssetOverrideSpec>& OutOverrides)
+	{
+		OutOverrides.Reset();
+		if (OverridesJson.IsEmpty())
+		{
+			return true;
+		}
+
+		TArray<TSharedPtr<FJsonValue>> RootArray;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(OverridesJson);
+		if (!FJsonSerializer::Deserialize(Reader, RootArray))
+		{
+			return false;
+		}
+
+		for (const TSharedPtr<FJsonValue>& Value : RootArray)
+		{
+			const TSharedPtr<FJsonObject> OverrideObject = Value.IsValid() ? Value->AsObject() : nullptr;
+			if (!OverrideObject.IsValid())
+			{
+				continue;
+			}
+
+			FString StateName;
+			OverrideObject->TryGetStringField(TEXT("StateName"), StateName);
+			if (StateName.IsEmpty())
+			{
+				continue;
+			}
+
+			FAnimAssetOverrideSpec OverrideSpec;
+			OverrideSpec.StateName = FName(*StateName);
+			OverrideObject->TryGetStringField(TEXT("AnimationAsset"), OverrideSpec.AnimationAssetPath);
+			if (OverrideSpec.AnimationAssetPath.IsEmpty())
+			{
+				OverrideObject->TryGetStringField(TEXT("AssetPath"), OverrideSpec.AnimationAssetPath);
+			}
+			OutOverrides.Add(OverrideSpec);
+		}
+
+		return true;
 	}
 
 	UEdGraphPin* FindFirstPin(UEdGraphNode* Node, EEdGraphPinDirection Direction)
@@ -513,7 +723,57 @@ namespace
 		return NewNode;
 	}
 
-	void ConnectStateMachineToRoot(UBlueprint* Blueprint, UEdGraph* AnimGraph, UAnimGraphNode_StateMachineBase* StateMachineNode)
+	UAnimGraphNode_Slot* FindSlotNode(UEdGraph* Graph, const FName SlotName)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(Node))
+			{
+				if (SlotName.IsNone() || SlotNode->Node.SlotName == SlotName)
+				{
+					return SlotNode;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	UAnimGraphNode_Slot* EnsureSlotNode(UEdGraph* AnimGraph, const FName SlotName, const bool bAlwaysUpdateSourcePose)
+	{
+		if (!AnimGraph || SlotName.IsNone())
+		{
+			return nullptr;
+		}
+
+		UAnimGraphNode_Slot* SlotNode = FindSlotNode(AnimGraph, SlotName);
+		if (!SlotNode)
+		{
+			FGraphNodeCreator<UAnimGraphNode_Slot> NodeCreator(*AnimGraph);
+			SlotNode = NodeCreator.CreateNode();
+			NodeCreator.Finalize();
+			if (!SlotNode)
+			{
+				return nullptr;
+			}
+			SlotNode->NodePosX = -208;
+			SlotNode->NodePosY = 64;
+		}
+
+		SlotNode->Node.SlotName = SlotName;
+		SlotNode->Node.bAlwaysUpdateSourcePose = bAlwaysUpdateSourcePose;
+		return SlotNode;
+	}
+
+	void ConnectStateMachineToOutput(
+		UBlueprint* Blueprint,
+		UEdGraph* AnimGraph,
+		UAnimGraphNode_StateMachineBase* StateMachineNode,
+		const FAnimStateMachineDefinition& Definition)
 	{
 		if (!Blueprint || !AnimGraph || !StateMachineNode)
 		{
@@ -536,6 +796,25 @@ namespace
 		if (RootIn->LinkedTo.Num() > 0)
 		{
 			RootIn->BreakAllPinLinks();
+		}
+
+		if (!Definition.OutputSlotName.IsNone())
+		{
+			if (UAnimGraphNode_Slot* SlotNode = EnsureSlotNode(AnimGraph, Definition.OutputSlotName, Definition.bAlwaysUpdateSourcePose))
+			{
+				UEdGraphPin* SlotIn = FindFirstPin(SlotNode, EGPD_Input);
+				UEdGraphPin* SlotOut = FindFirstPin(SlotNode, EGPD_Output);
+				if (SlotIn && SlotOut)
+				{
+					if (SlotIn->LinkedTo.Num() > 0)
+					{
+						SlotIn->BreakAllPinLinks();
+					}
+					AnimGraph->GetSchema()->TryCreateConnection(StateMachineOut, SlotIn);
+					AnimGraph->GetSchema()->TryCreateConnection(SlotOut, RootIn);
+					return;
+				}
+			}
 		}
 
 		AnimGraph->GetSchema()->TryCreateConnection(StateMachineOut, RootIn);
@@ -786,9 +1065,125 @@ namespace
 		return nullptr;
 	}
 
-	void ConfigureTransitionRule(UBlueprint* Blueprint, UEdGraph* TransitionGraph, const FName BoolVarName, const bool bExpectedValue)
+	UClass* GetTransitionVariableOwnerClass(UBlueprint* Blueprint)
 	{
-		if (!Blueprint || !TransitionGraph || BoolVarName.IsNone())
+		if (!Blueprint)
+		{
+			return nullptr;
+		}
+
+		return Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+	}
+
+	UFunction* ResolveNumericComparisonFunction(const FProperty* Property, const EAnimTransitionComparisonOp ComparisonOp)
+	{
+		if (!Property)
+		{
+			return nullptr;
+		}
+
+		const TCHAR* Suffix = TEXT("DoubleDouble");
+		FName FunctionName = NAME_None;
+
+		switch (ComparisonOp)
+		{
+		case EAnimTransitionComparisonOp::Equal:
+			FunctionName = FName(*FString::Printf(TEXT("EqualEqual_%s"), Suffix));
+			break;
+		case EAnimTransitionComparisonOp::NotEqual:
+			FunctionName = FName(*FString::Printf(TEXT("NotEqual_%s"), Suffix));
+			break;
+		case EAnimTransitionComparisonOp::Greater:
+			FunctionName = FName(*FString::Printf(TEXT("Greater_%s"), Suffix));
+			break;
+		case EAnimTransitionComparisonOp::GreaterOrEqual:
+			FunctionName = FName(*FString::Printf(TEXT("GreaterEqual_%s"), Suffix));
+			break;
+		case EAnimTransitionComparisonOp::Less:
+			FunctionName = FName(*FString::Printf(TEXT("Less_%s"), Suffix));
+			break;
+		case EAnimTransitionComparisonOp::LessOrEqual:
+			FunctionName = FName(*FString::Printf(TEXT("LessEqual_%s"), Suffix));
+			break;
+		default:
+			return nullptr;
+		}
+
+		return FindUField<UFunction>(UKismetMathLibrary::StaticClass(), FunctionName);
+	}
+
+	UEdGraphPin* FindNthDataInputPin(UK2Node* Node, int32 InputIndex)
+	{
+		if (!Node || InputIndex < 0)
+		{
+			return nullptr;
+		}
+
+		int32 CurrentIndex = 0;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Input)
+			{
+				continue;
+			}
+
+			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || Pin->PinName == UEdGraphSchema_K2::PN_Self)
+			{
+				continue;
+			}
+
+			if (CurrentIndex == InputIndex)
+			{
+				return Pin;
+			}
+			++CurrentIndex;
+		}
+
+		return nullptr;
+	}
+
+	UEdGraphPin* FindBoolOutputPin(UK2Node* Node)
+	{
+		if (!Node)
+		{
+			return nullptr;
+		}
+
+		if (UK2Node_CallFunction* CallFunctionNode = Cast<UK2Node_CallFunction>(Node))
+		{
+			if (UEdGraphPin* ReturnPin = CallFunctionNode->GetReturnValuePin())
+			{
+				return ReturnPin;
+			}
+		}
+
+		if (UK2Node_CommutativeAssociativeBinaryOperator* BinaryOperatorNode = Cast<UK2Node_CommutativeAssociativeBinaryOperator>(Node))
+		{
+			if (UEdGraphPin* ReturnPin = BinaryOperatorNode->GetReturnValuePin())
+			{
+				return ReturnPin;
+			}
+		}
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output)
+			{
+				continue;
+			}
+
+			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+			{
+				return Pin;
+			}
+		}
+
+		return nullptr;
+	}
+
+	void ConfigureTransitionRule(UBlueprint* Blueprint, UEdGraph* TransitionGraph, const FAnimStateMachineTransitionSpec& TransitionSpec)
+	{
+		if (!Blueprint || !TransitionGraph || TransitionSpec.ConditionVariable.IsNone())
 		{
 			return;
 		}
@@ -809,16 +1204,16 @@ namespace
 			return;
 		}
 
-		UClass* VariableOwnerClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+		UClass* VariableOwnerClass = GetTransitionVariableOwnerClass(Blueprint);
 		if (!VariableOwnerClass)
 		{
 			return;
 		}
 
-		FProperty* Property = FindFProperty<FProperty>(VariableOwnerClass, BoolVarName);
+		FProperty* Property = FindFProperty<FProperty>(VariableOwnerClass, TransitionSpec.ConditionVariable);
 		if (!Property)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Missing bool variable for transition: %s"), *BoolVarName.ToString());
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Missing transition variable: %s"), *TransitionSpec.ConditionVariable.ToString());
 			return;
 		}
 
@@ -836,33 +1231,84 @@ namespace
 			return;
 		}
 
-		if (bExpectedValue)
+		if (TransitionSpec.ConditionType == EAnimTransitionConditionType::Bool)
 		{
-			TransitionGraph->GetSchema()->TryCreateConnection(ValuePin, ResultPin);
+			if (TransitionSpec.bExpectedValue)
+			{
+				TransitionGraph->GetSchema()->TryCreateConnection(ValuePin, ResultPin);
+				return;
+			}
+
+			UFunction* NotFunction = FindUField<UFunction>(UKismetMathLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool));
+			if (!NotFunction)
+			{
+				return;
+			}
+
+			FGraphNodeCreator<UK2Node_CallFunction> FuncCreator(*TransitionGraph);
+			UK2Node_CallFunction* NotNode = FuncCreator.CreateNode();
+			NotNode->SetFromFunction(NotFunction);
+			FuncCreator.Finalize();
+			NotNode->NodePosX = -120;
+			NotNode->NodePosY = -8;
+
+			UEdGraphPin* InputPin = NotNode->FindPin(TEXT("A"));
+			UEdGraphPin* ReturnPin = NotNode->GetReturnValuePin();
+			if (!InputPin || !ReturnPin)
+			{
+				return;
+			}
+
+			TransitionGraph->GetSchema()->TryCreateConnection(ValuePin, InputPin);
+			TransitionGraph->GetSchema()->TryCreateConnection(ReturnPin, ResultPin);
 			return;
 		}
 
-		UFunction* NotFunction = FindUField<UFunction>(UKismetMathLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool));
-		if (!NotFunction)
+		if (!CastField<const FNumericProperty>(Property))
 		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Transition requested numeric comparison on non-numeric variable: %s"), *TransitionSpec.ConditionVariable.ToString());
+			return;
+		}
+
+		UFunction* ComparisonFunction = ResolveNumericComparisonFunction(Property, TransitionSpec.ComparisonOp);
+		if (!ComparisonFunction)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Unsupported numeric transition comparison for %s"), *TransitionSpec.ConditionVariable.ToString());
 			return;
 		}
 
 		FGraphNodeCreator<UK2Node_CallFunction> FuncCreator(*TransitionGraph);
-		UK2Node_CallFunction* NotNode = FuncCreator.CreateNode();
-		NotNode->SetFromFunction(NotFunction);
+		UK2Node_CallFunction* CompareNode = FuncCreator.CreateNode();
+		CompareNode->SetFromFunction(ComparisonFunction);
 		FuncCreator.Finalize();
-		NotNode->NodePosX = -120;
-		NotNode->NodePosY = -8;
+		CompareNode->NodePosX = -120;
+		CompareNode->NodePosY = -8;
+		CompareNode->ReconstructNode();
 
-		UEdGraphPin* InputPin = NotNode->FindPin(TEXT("A"));
-		UEdGraphPin* ReturnPin = NotNode->GetReturnValuePin();
-		if (!InputPin || !ReturnPin)
+		UEdGraphPin* InputPinA = CompareNode->FindPin(TEXT("A"));
+		UEdGraphPin* InputPinB = CompareNode->FindPin(TEXT("B"));
+		if (!InputPinA)
 		{
+			InputPinA = FindNthDataInputPin(CompareNode, 0);
+		}
+		if (!InputPinB)
+		{
+			InputPinB = FindNthDataInputPin(CompareNode, 1);
+		}
+		UEdGraphPin* ReturnPin = FindBoolOutputPin(CompareNode);
+		if (!InputPinA || !InputPinB || !ReturnPin)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[BPFactory] Failed to resolve pins for numeric transition comparison %s using node %s"),
+				*TransitionSpec.ConditionVariable.ToString(),
+				*GetNameSafe(CompareNode));
 			return;
 		}
 
-		TransitionGraph->GetSchema()->TryCreateConnection(ValuePin, InputPin);
+		InputPinB->DefaultValue = FString::SanitizeFloat(TransitionSpec.NumericValue);
+		TransitionGraph->GetSchema()->TryCreateConnection(ValuePin, InputPinA);
 		TransitionGraph->GetSchema()->TryCreateConnection(ReturnPin, ResultPin);
 	}
 
@@ -871,8 +1317,7 @@ namespace
 		UEdGraph* StateMachineGraph,
 		UAnimStateNodeBase* FromState,
 		UAnimStateNodeBase* ToState,
-		const FName BoolVarName,
-		const bool bExpectedValue,
+		const FAnimStateMachineTransitionSpec& TransitionSpec,
 		const int32 PriorityOrder,
 		const float CrossfadeDuration)
 	{
@@ -901,8 +1346,551 @@ namespace
 		TransitionNode->PriorityOrder = PriorityOrder;
 		TransitionNode->CrossfadeDuration = CrossfadeDuration;
 		TransitionNode->bAutomaticRuleBasedOnSequencePlayerInState = false;
-		ConfigureTransitionRule(Blueprint, TransitionNode->BoundGraph, BoolVarName, bExpectedValue);
+		ConfigureTransitionRule(Blueprint, TransitionNode->BoundGraph, TransitionSpec);
 		return TransitionNode;
+	}
+
+	FName GetStateName(const UAnimStateNode* StateNode)
+	{
+		if (!StateNode)
+		{
+			return NAME_None;
+		}
+
+		if (StateNode->BoundGraph)
+		{
+			return StateNode->BoundGraph->GetFName();
+		}
+
+		return FName(*StateNode->GetNodeTitle(ENodeTitleType::ListView).ToString());
+	}
+
+	UAnimGraphNode_SequencePlayer* FindSequencePlayerNode(UEdGraph* StateGraph)
+	{
+		if (!StateGraph)
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : StateGraph->Nodes)
+		{
+			if (UAnimGraphNode_SequencePlayer* SequencePlayer = Cast<UAnimGraphNode_SequencePlayer>(Node))
+			{
+				return SequencePlayer;
+			}
+		}
+
+		return nullptr;
+	}
+
+	UAnimGraphNode_StateMachineBase* FindPrimaryStateMachineNode(UEdGraph* AnimGraph)
+	{
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph);
+		if (RootNode)
+		{
+			if (UEdGraphPin* RootIn = FindFirstPin(RootNode, EGPD_Input))
+			{
+				for (UEdGraphPin* LinkedPin : RootIn->LinkedTo)
+				{
+					if (!LinkedPin)
+					{
+						continue;
+					}
+
+					if (UAnimGraphNode_StateMachineBase* DirectStateMachine = Cast<UAnimGraphNode_StateMachineBase>(LinkedPin->GetOwningNode()))
+					{
+						return DirectStateMachine;
+					}
+
+					if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(LinkedPin->GetOwningNode()))
+					{
+						if (UEdGraphPin* SlotSource = FindFirstPin(SlotNode, EGPD_Input))
+						{
+							for (UEdGraphPin* SlotLinkedPin : SlotSource->LinkedTo)
+							{
+								if (SlotLinkedPin)
+								{
+									if (UAnimGraphNode_StateMachineBase* IndirectStateMachine = Cast<UAnimGraphNode_StateMachineBase>(SlotLinkedPin->GetOwningNode()))
+									{
+										return IndirectStateMachine;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		for (UEdGraphNode* Node : AnimGraph->Nodes)
+		{
+			if (UAnimGraphNode_StateMachineBase* StateMachineNode = Cast<UAnimGraphNode_StateMachineBase>(Node))
+			{
+				return StateMachineNode;
+			}
+		}
+
+		return nullptr;
+	}
+
+	UAnimGraphNode_Slot* FindPrimaryOutputSlotNode(UEdGraph* AnimGraph)
+	{
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		if (UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph))
+		{
+			if (UEdGraphPin* RootIn = FindFirstPin(RootNode, EGPD_Input))
+			{
+				for (UEdGraphPin* LinkedPin : RootIn->LinkedTo)
+				{
+					if (LinkedPin)
+					{
+						if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(LinkedPin->GetOwningNode()))
+						{
+							return SlotNode;
+						}
+					}
+				}
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool TryExtractLinkedVariable(UEdGraphPin* Pin, FName& OutVariableName)
+	{
+		OutVariableName = NAME_None;
+		if (!Pin || Pin->LinkedTo.Num() == 0)
+		{
+			return false;
+		}
+
+		if (UK2Node_VariableGet* VarNode = Cast<UK2Node_VariableGet>(Pin->LinkedTo[0] ? Pin->LinkedTo[0]->GetOwningNode() : nullptr))
+		{
+			OutVariableName = VarNode->GetVarName();
+			return !OutVariableName.IsNone();
+		}
+
+		return false;
+	}
+
+	bool TryMapFunctionNameToComparison(const FName FunctionName, EAnimTransitionComparisonOp& OutComparisonOp)
+	{
+		const FString FunctionNameString = FunctionName.ToString();
+		if (FunctionNameString.StartsWith(TEXT("EqualEqual_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::Equal;
+			return true;
+		}
+		if (FunctionNameString.StartsWith(TEXT("NotEqual_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::NotEqual;
+			return true;
+		}
+		if (FunctionNameString.StartsWith(TEXT("GreaterEqual_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::GreaterOrEqual;
+			return true;
+		}
+		if (FunctionNameString.StartsWith(TEXT("Greater_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::Greater;
+			return true;
+		}
+		if (FunctionNameString.StartsWith(TEXT("LessEqual_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::LessOrEqual;
+			return true;
+		}
+		if (FunctionNameString.StartsWith(TEXT("Less_")))
+		{
+			OutComparisonOp = EAnimTransitionComparisonOp::Less;
+			return true;
+		}
+		return false;
+	}
+
+	bool TryExtractNumericDefaultValue(UEdGraphPin* Pin, double& OutValue)
+	{
+		OutValue = 0.0;
+		if (!Pin)
+		{
+			return false;
+		}
+
+		if (!Pin->DefaultValue.IsEmpty())
+		{
+			OutValue = FCString::Atod(*Pin->DefaultValue);
+			return true;
+		}
+
+		return false;
+	}
+
+	bool ExtractTransitionCondition(UEdGraph* TransitionGraph, FAnimStateMachineTransitionSpec& OutTransitionSpec)
+	{
+		OutTransitionSpec.ConditionVariable = NAME_None;
+		OutTransitionSpec.ConditionType = EAnimTransitionConditionType::Bool;
+		OutTransitionSpec.bExpectedValue = true;
+		OutTransitionSpec.ComparisonOp = EAnimTransitionComparisonOp::Equal;
+		OutTransitionSpec.NumericValue = 0.0;
+		if (!TransitionGraph)
+		{
+			return false;
+		}
+
+		UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+		for (UEdGraphNode* Node : TransitionGraph->Nodes)
+		{
+			if (UAnimGraphNode_TransitionResult* Candidate = Cast<UAnimGraphNode_TransitionResult>(Node))
+			{
+				ResultNode = Candidate;
+				break;
+			}
+		}
+		if (!ResultNode)
+		{
+			return false;
+		}
+
+		UEdGraphPin* ResultPin = ResultNode->FindPin(TEXT("bCanEnterTransition"));
+		if (!ResultPin || ResultPin->LinkedTo.Num() == 0)
+		{
+			return false;
+		}
+
+		UEdGraphNode* SourceNode = ResultPin->LinkedTo[0] ? ResultPin->LinkedTo[0]->GetOwningNode() : nullptr;
+		if (UK2Node_VariableGet* VarNode = Cast<UK2Node_VariableGet>(SourceNode))
+		{
+			OutTransitionSpec.ConditionVariable = VarNode->GetVarName();
+			OutTransitionSpec.ConditionType = EAnimTransitionConditionType::Bool;
+			OutTransitionSpec.bExpectedValue = true;
+			return !OutTransitionSpec.ConditionVariable.IsNone();
+		}
+
+		if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(SourceNode))
+		{
+			if (CallNode->GetFunctionName() == GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool))
+			{
+				if (UEdGraphPin* InputPin = CallNode->FindPin(TEXT("A")))
+				{
+					if (TryExtractLinkedVariable(InputPin, OutTransitionSpec.ConditionVariable))
+					{
+						OutTransitionSpec.ConditionType = EAnimTransitionConditionType::Bool;
+						OutTransitionSpec.bExpectedValue = false;
+						return true;
+					}
+				}
+			}
+
+			EAnimTransitionComparisonOp ComparisonOp = EAnimTransitionComparisonOp::Equal;
+			if (TryMapFunctionNameToComparison(CallNode->GetFunctionName(), ComparisonOp))
+			{
+				FName VariableName = NAME_None;
+				double NumericValue = 0.0;
+				if (TryExtractLinkedVariable(CallNode->FindPin(TEXT("A")), VariableName)
+					&& TryExtractNumericDefaultValue(CallNode->FindPin(TEXT("B")), NumericValue))
+				{
+					OutTransitionSpec.ConditionVariable = VariableName;
+					OutTransitionSpec.ConditionType = EAnimTransitionConditionType::NumericComparison;
+					OutTransitionSpec.ComparisonOp = ComparisonOp;
+					OutTransitionSpec.NumericValue = NumericValue;
+					return !OutTransitionSpec.ConditionVariable.IsNone();
+				}
+
+				if (TryExtractLinkedVariable(CallNode->FindPin(TEXT("B")), VariableName)
+					&& TryExtractNumericDefaultValue(CallNode->FindPin(TEXT("A")), NumericValue))
+				{
+					OutTransitionSpec.ConditionVariable = VariableName;
+					OutTransitionSpec.ConditionType = EAnimTransitionConditionType::NumericComparison;
+					OutTransitionSpec.ComparisonOp = ComparisonOp;
+					OutTransitionSpec.NumericValue = NumericValue;
+					return !OutTransitionSpec.ConditionVariable.IsNone();
+				}
+			}
+		}
+
+		return false;
+	}
+
+	TMap<FGuid, FName> BuildPlayerNodeGuidToStateMap(UAnimBlueprint* AnimBlueprint)
+	{
+		TMap<FGuid, FName> Result;
+		if (!AnimBlueprint)
+		{
+			return Result;
+		}
+
+		TArray<UEdGraph*> AllGraphs;
+		AnimBlueprint->GetAllGraphs(AllGraphs);
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			UAnimationStateMachineGraph* StateMachineGraph = Cast<UAnimationStateMachineGraph>(Graph);
+			if (!StateMachineGraph)
+			{
+				continue;
+			}
+
+			for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+			{
+				UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node);
+				if (!StateNode || !StateNode->BoundGraph)
+				{
+					continue;
+				}
+
+				if (UAnimGraphNode_SequencePlayer* SequencePlayer = FindSequencePlayerNode(StateNode->BoundGraph))
+				{
+					Result.Add(SequencePlayer->NodeGuid, GetStateName(StateNode));
+				}
+			}
+		}
+
+		return Result;
+	}
+
+	TMap<FName, FGuid> BuildStateToPlayerNodeGuidMap(UAnimBlueprint* AnimBlueprint)
+	{
+		TMap<FName, FGuid> Result;
+		for (const TPair<FGuid, FName>& Pair : BuildPlayerNodeGuidToStateMap(AnimBlueprint))
+		{
+			Result.Add(Pair.Value, Pair.Key);
+		}
+		return Result;
+	}
+
+	FString GetAnimationAssetPath(UAnimationAsset* AnimationAsset)
+	{
+		return AnimationAsset ? AnimationAsset->GetOutermost()->GetName() : FString();
+	}
+
+	FString GetBlueprintUnLuaModuleName(UBlueprint* Blueprint)
+	{
+		if (!Blueprint)
+		{
+			return FString();
+		}
+
+		bool bHasUnLuaInterface = false;
+		for (const FBPInterfaceDescription& InterfaceDesc : Blueprint->ImplementedInterfaces)
+		{
+			if (InterfaceDesc.Interface && InterfaceDesc.Interface->GetName().Contains(TEXT("UnLuaInterface")))
+			{
+				bHasUnLuaInterface = true;
+				break;
+			}
+		}
+		if (!bHasUnLuaInterface)
+		{
+			return FString();
+		}
+
+		TArray<UEdGraph*> AllGraphs;
+		AllGraphs.Append(Blueprint->FunctionGraphs);
+		for (const FBPInterfaceDescription& InterfaceDesc : Blueprint->ImplementedInterfaces)
+		{
+			AllGraphs.Append(InterfaceDesc.Graphs);
+		}
+
+		for (UEdGraph* Graph : AllGraphs)
+		{
+			if (!Graph || !Graph->GetFName().ToString().Contains(TEXT("GetModuleName")))
+			{
+				continue;
+			}
+
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UK2Node_FunctionResult* ResultNode = Cast<UK2Node_FunctionResult>(Node);
+				if (!ResultNode)
+				{
+					continue;
+				}
+
+				for (UEdGraphPin* Pin : ResultNode->Pins)
+				{
+					if (Pin && Pin->PinName == TEXT("ReturnValue") && !Pin->DefaultValue.IsEmpty())
+					{
+						return Pin->DefaultValue;
+					}
+				}
+			}
+		}
+
+		return FString();
+	}
+
+	TSharedPtr<FJsonObject> BuildStateMachineDefinitionObject(UAnimBlueprint* AnimBlueprint)
+	{
+		UEdGraph* AnimGraph = FindAnimGraph(AnimBlueprint);
+		UAnimGraphNode_StateMachineBase* StateMachineNode = FindPrimaryStateMachineNode(AnimGraph);
+		UAnimationStateMachineGraph* StateMachineGraph = StateMachineNode ? StateMachineNode->EditorStateMachineGraph.Get() : nullptr;
+		if (!AnimGraph || !StateMachineNode || !StateMachineGraph)
+		{
+			return nullptr;
+		}
+
+		TSharedPtr<FJsonObject> DefinitionObject = MakeShared<FJsonObject>();
+		DefinitionObject->SetStringField(TEXT("StateMachineName"), StateMachineGraph->GetName());
+
+		if (UAnimGraphNode_Slot* SlotNode = FindPrimaryOutputSlotNode(AnimGraph))
+		{
+			if (!SlotNode->Node.SlotName.IsNone())
+			{
+				DefinitionObject->SetStringField(TEXT("OutputSlotName"), SlotNode->Node.SlotName.ToString());
+			}
+			if (SlotNode->Node.bAlwaysUpdateSourcePose)
+			{
+				DefinitionObject->SetBoolField(TEXT("AlwaysUpdateSourcePose"), true);
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> VariableValues;
+		for (const FBPVariableDescription& VariableDesc : AnimBlueprint->NewVariables)
+		{
+			const FString TypeName = ExportPinTypeName(VariableDesc.VarType);
+			if (TypeName.IsEmpty())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> VariableObject = MakeShared<FJsonObject>();
+			VariableObject->SetStringField(TEXT("Name"), VariableDesc.VarName.ToString());
+			VariableObject->SetStringField(TEXT("Type"), TypeName);
+			VariableValues.Add(MakeShared<FJsonValueObject>(VariableObject));
+		}
+		if (VariableValues.Num() > 0)
+		{
+			DefinitionObject->SetArrayField(TEXT("Variables"), VariableValues);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> StateValues;
+		for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+		{
+			UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node);
+			if (!StateNode)
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> StateObject = MakeShared<FJsonObject>();
+			StateObject->SetStringField(TEXT("Name"), GetStateName(StateNode).ToString());
+			StateObject->SetObjectField(TEXT("NodePosition"), MakeShared<FJsonObject>());
+			StateObject->GetObjectField(TEXT("NodePosition"))->SetNumberField(TEXT("X"), StateNode->NodePosX);
+			StateObject->GetObjectField(TEXT("NodePosition"))->SetNumberField(TEXT("Y"), StateNode->NodePosY);
+			if (UAnimGraphNode_SequencePlayer* SequencePlayer = FindSequencePlayerNode(StateNode->BoundGraph))
+			{
+				StateObject->SetStringField(TEXT("AnimationAsset"), GetAnimationAssetPath(SequencePlayer->GetAnimationAsset()));
+			}
+			StateValues.Add(MakeShared<FJsonValueObject>(StateObject));
+		}
+		if (StateValues.Num() > 0)
+		{
+			DefinitionObject->SetArrayField(TEXT("States"), StateValues);
+		}
+
+		if (UAnimStateEntryNode* EntryNode = FindEntryNode(StateMachineGraph))
+		{
+			if (UEdGraphPin* EntryOutput = FindFirstPin(EntryNode, EGPD_Output))
+			{
+				for (UEdGraphPin* LinkedPin : EntryOutput->LinkedTo)
+				{
+					if (UAnimStateNode* EntryState = Cast<UAnimStateNode>(LinkedPin ? LinkedPin->GetOwningNode() : nullptr))
+					{
+						DefinitionObject->SetStringField(TEXT("EntryState"), GetStateName(EntryState).ToString());
+						break;
+					}
+				}
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> TransitionValues;
+		for (UEdGraphNode* Node : StateMachineGraph->Nodes)
+		{
+			UAnimStateTransitionNode* TransitionNode = Cast<UAnimStateTransitionNode>(Node);
+			if (!TransitionNode)
+			{
+				continue;
+			}
+
+			UAnimStateNode* FromState = Cast<UAnimStateNode>(TransitionNode->GetPreviousState());
+			UAnimStateNode* ToState = Cast<UAnimStateNode>(TransitionNode->GetNextState());
+			if (!FromState || !ToState)
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> TransitionObject = MakeShared<FJsonObject>();
+			TransitionObject->SetStringField(TEXT("From"), GetStateName(FromState).ToString());
+			TransitionObject->SetStringField(TEXT("To"), GetStateName(ToState).ToString());
+			TransitionObject->SetNumberField(TEXT("Priority"), TransitionNode->PriorityOrder);
+			TransitionObject->SetNumberField(TEXT("CrossfadeDuration"), TransitionNode->CrossfadeDuration);
+
+			FAnimStateMachineTransitionSpec ExtractedTransitionSpec;
+			if (ExtractTransitionCondition(TransitionNode->BoundGraph, ExtractedTransitionSpec) && !ExtractedTransitionSpec.ConditionVariable.IsNone())
+			{
+				TSharedPtr<FJsonObject> ConditionObject = MakeShared<FJsonObject>();
+				ConditionObject->SetStringField(TEXT("Variable"), ExtractedTransitionSpec.ConditionVariable.ToString());
+				if (ExtractedTransitionSpec.ConditionType == EAnimTransitionConditionType::NumericComparison)
+				{
+					ConditionObject->SetStringField(TEXT("Operator"), TransitionComparisonOpToString(ExtractedTransitionSpec.ComparisonOp));
+					ConditionObject->SetNumberField(TEXT("Value"), ExtractedTransitionSpec.NumericValue);
+				}
+				else
+				{
+					ConditionObject->SetBoolField(TEXT("Value"), ExtractedTransitionSpec.bExpectedValue);
+				}
+				TransitionObject->SetObjectField(TEXT("Condition"), ConditionObject);
+			}
+
+			TransitionValues.Add(MakeShared<FJsonValueObject>(TransitionObject));
+		}
+		if (TransitionValues.Num() > 0)
+		{
+			DefinitionObject->SetArrayField(TEXT("Transitions"), TransitionValues);
+		}
+
+		return DefinitionObject;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> BuildAnimationOverridesArray(UAnimBlueprint* AnimBlueprint)
+	{
+		TArray<TSharedPtr<FJsonValue>> OverrideValues;
+		if (!AnimBlueprint || AnimBlueprint->ParentAssetOverrides.Num() == 0)
+		{
+			return OverrideValues;
+		}
+
+		UAnimBlueprint* RootAnimBlueprint = UAnimBlueprint::FindRootAnimBlueprint(AnimBlueprint);
+		if (!RootAnimBlueprint)
+		{
+			RootAnimBlueprint = AnimBlueprint;
+		}
+
+		const TMap<FGuid, FName> GuidToStateName = BuildPlayerNodeGuidToStateMap(RootAnimBlueprint);
+		for (const FAnimParentNodeAssetOverride& Override : AnimBlueprint->ParentAssetOverrides)
+		{
+			const FName* StateName = GuidToStateName.Find(Override.ParentNodeGuid);
+			if (!StateName || StateName->IsNone() || !Override.NewAsset)
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> OverrideObject = MakeShared<FJsonObject>();
+			OverrideObject->SetStringField(TEXT("StateName"), StateName->ToString());
+			OverrideObject->SetStringField(TEXT("AnimationAsset"), GetAnimationAssetPath(Override.NewAsset));
+			OverrideValues.Add(MakeShared<FJsonValueObject>(OverrideObject));
+		}
+
+		return OverrideValues;
 	}
 
 	bool ApplyStateMachineDefinition(UAnimBlueprint* AnimBlueprint, const FAnimStateMachineDefinition& Definition)
@@ -944,7 +1932,7 @@ namespace
 			return false;
 		}
 
-		ConnectStateMachineToRoot(AnimBlueprint, AnimGraph, StateMachineNode);
+		ConnectStateMachineToOutput(AnimBlueprint, AnimGraph, StateMachineNode, Definition);
 		ClearStateMachineGraph(AnimBlueprint, StateMachineGraph);
 
 		TMap<FName, UAnimStateNode*> CreatedStates;
@@ -1003,8 +1991,7 @@ namespace
 				StateMachineGraph,
 				FromStateNode,
 				ToStateNode,
-				TransitionSpec.ConditionVariable,
-				TransitionSpec.bExpectedValue,
+				TransitionSpec,
 				TransitionSpec.Priority,
 				TransitionSpec.CrossfadeDuration);
 
@@ -1326,4 +2313,158 @@ bool UBPFactoryBlueprintLibrary::SetupAnimStateMachineFromJson(
 	}
 
 	return ApplyStateMachineDefinition(AnimBlueprint, Definition);
+}
+
+bool UBPFactoryBlueprintLibrary::SetupAnimAssetOverridesFromJson(
+	UAnimBlueprint* AnimBlueprint,
+	const FString& OverridesJson)
+{
+	if (!AnimBlueprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BPFactory] SetupAnimAssetOverridesFromJson failed: AnimBlueprint is null"));
+		return false;
+	}
+
+	TArray<FAnimAssetOverrideSpec> OverrideSpecs;
+	if (!ParseAnimationOverridesJson(OverridesJson, OverrideSpecs))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BPFactory] SetupAnimAssetOverridesFromJson failed: invalid overrides json"));
+		return false;
+	}
+
+	UAnimBlueprint* RootAnimBlueprint = UAnimBlueprint::FindRootAnimBlueprint(AnimBlueprint);
+	if (!RootAnimBlueprint)
+	{
+		RootAnimBlueprint = AnimBlueprint;
+	}
+
+	const TMap<FName, FGuid> StateToGuidMap = BuildStateToPlayerNodeGuidMap(RootAnimBlueprint);
+	TMap<FGuid, FAnimParentNodeAssetOverride> PreservedOverrides;
+	for (const FAnimParentNodeAssetOverride& ExistingOverride : AnimBlueprint->ParentAssetOverrides)
+	{
+		PreservedOverrides.Add(ExistingOverride.ParentNodeGuid, ExistingOverride);
+	}
+
+	TArray<FGuid> KnownGuids;
+	StateToGuidMap.GenerateValueArray(KnownGuids);
+	for (const FGuid& KnownGuid : KnownGuids)
+	{
+		PreservedOverrides.Remove(KnownGuid);
+	}
+
+	for (const FAnimAssetOverrideSpec& OverrideSpec : OverrideSpecs)
+	{
+		if (OverrideSpec.StateName.IsNone())
+		{
+			continue;
+		}
+
+		const FGuid* ParentNodeGuid = StateToGuidMap.Find(OverrideSpec.StateName);
+		if (!ParentNodeGuid || !ParentNodeGuid->IsValid())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Anim override skipped: unknown state %s on %s"),
+				*OverrideSpec.StateName.ToString(),
+				*AnimBlueprint->GetName());
+			continue;
+		}
+
+		if (OverrideSpec.AnimationAssetPath.IsEmpty())
+		{
+			continue;
+		}
+
+		UAnimationAsset* AnimationAsset = LoadEditorAsset<UAnimationAsset>(OverrideSpec.AnimationAssetPath);
+		if (!AnimationAsset)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] Anim override skipped: missing animation asset %s"),
+				*OverrideSpec.AnimationAssetPath);
+			continue;
+		}
+
+		FAnimParentNodeAssetOverride NewOverride;
+		NewOverride.ParentNodeGuid = *ParentNodeGuid;
+		NewOverride.NewAsset = AnimationAsset;
+		PreservedOverrides.Add(NewOverride.ParentNodeGuid, NewOverride);
+	}
+
+	AnimBlueprint->Modify();
+	AnimBlueprint->ParentAssetOverrides.Reset();
+	TArray<FGuid> SortedGuids;
+	PreservedOverrides.GetKeys(SortedGuids);
+	SortedGuids.Sort([](const FGuid& A, const FGuid& B)
+	{
+		return A.ToString(EGuidFormats::Digits) < B.ToString(EGuidFormats::Digits);
+	});
+	for (const FGuid& Guid : SortedGuids)
+	{
+		if (const FAnimParentNodeAssetOverride* Override = PreservedOverrides.Find(Guid))
+		{
+			AnimBlueprint->ParentAssetOverrides.Add(*Override);
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+	CompileBlueprint(AnimBlueprint);
+	return true;
+}
+
+bool UBPFactoryBlueprintLibrary::SetAnimBlueprintPreviewMesh(
+	UAnimBlueprint* AnimBlueprint,
+	USkeletalMesh* PreviewMesh,
+	bool bMarkDirty)
+{
+	if (!AnimBlueprint || !PreviewMesh)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BPFactory] SetAnimBlueprintPreviewMesh failed: invalid input"));
+		return false;
+	}
+
+	AnimBlueprint->Modify();
+	AnimBlueprint->SetPreviewMesh(PreviewMesh, bMarkDirty);
+	if (bMarkDirty)
+	{
+		AnimBlueprint->MarkPackageDirty();
+	}
+	return true;
+}
+
+FString UBPFactoryBlueprintLibrary::ExportAnimBlueprintMetadataToJson(
+	UAnimBlueprint* AnimBlueprint)
+{
+	if (!AnimBlueprint)
+	{
+		return TEXT("{}");
+	}
+
+	TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	UAnimBlueprint* RootAnimBlueprint = UAnimBlueprint::FindRootAnimBlueprint(AnimBlueprint);
+	if (!RootAnimBlueprint)
+	{
+		RootAnimBlueprint = AnimBlueprint;
+	}
+
+	if (RootAnimBlueprint == AnimBlueprint)
+	{
+		if (TSharedPtr<FJsonObject> StateMachineDefinition = BuildStateMachineDefinitionObject(AnimBlueprint))
+		{
+			RootObject->SetObjectField(TEXT("StateMachineDefinition"), StateMachineDefinition);
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>> AnimationOverrides = BuildAnimationOverridesArray(AnimBlueprint);
+	if (AnimationOverrides.Num() > 0)
+	{
+		RootObject->SetArrayField(TEXT("AnimationOverrides"), AnimationOverrides);
+	}
+
+	const FString UnLuaBinding = GetBlueprintUnLuaModuleName(AnimBlueprint);
+	if (!UnLuaBinding.IsEmpty())
+	{
+		RootObject->SetStringField(TEXT("UnLuaBinding"), UnLuaBinding);
+	}
+
+	FString JsonString;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
+	FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+	return JsonString.IsEmpty() ? TEXT("{}") : JsonString;
 }

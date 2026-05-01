@@ -23,6 +23,18 @@ def _log_error(msg):
         print(f"[AnimBPFactory ERROR] {msg}")
 
 
+def _load_existing_template(json_path):
+    if not json_path or not os.path.isfile(json_path):
+        return {}
+    try:
+        with open(json_path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        _log(f"  Failed to read existing template, falling back to full export: {exc}")
+        return {}
+
+
 def _resolve_unlua_binding(unlua_binding):
     if isinstance(unlua_binding, dict):
         if not unlua_binding.get("Enabled", True):
@@ -104,6 +116,18 @@ def _load_asset(path):
         pass
 
     return None
+
+
+def _asset_package_path(asset):
+    if not asset:
+        return ""
+    try:
+        path_name = asset.get_path_name()
+    except Exception:
+        return ""
+    if "." in path_name:
+        return path_name.rsplit(".", 1)[0]
+    return path_name
 
 
 def _compile_blueprint(bp):
@@ -195,6 +219,97 @@ def _apply_state_machine_definition(bp, template):
         _log("  State machine definition apply failed")
 
 
+def _apply_animation_overrides(bp, template):
+    overrides = template.get("AnimationOverrides")
+    if not isinstance(overrides, list):
+        return
+
+    lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+    if not lib:
+        _log("  Animation overrides skipped: missing BPFactoryBlueprintLibrary")
+        return
+
+    func = getattr(lib, "setup_anim_asset_overrides_from_json", None)
+    if not callable(func):
+        func = getattr(lib, "SetupAnimAssetOverridesFromJson", None)
+    if not callable(func):
+        _log("  Animation overrides skipped: SetupAnimAssetOverridesFromJson not found")
+        return
+
+    ok = bool(func(bp, json.dumps(overrides, ensure_ascii=False)))
+    if ok:
+        _log("  Animation overrides applied")
+    else:
+        _log("  Animation overrides apply failed")
+
+
+def _apply_anim_blueprint_properties(bp, is_template, target_skeleton=None, preview_mesh=None):
+    if not bp:
+        return
+
+    try:
+        bp.set_editor_property("bTemplate", bool(is_template))
+    except Exception:
+        pass
+
+    if target_skeleton:
+        try:
+            bp.set_editor_property("TargetSkeleton", target_skeleton)
+        except Exception as exc:
+            _log(f"  TargetSkeleton update skipped: {exc}")
+
+    if preview_mesh:
+        lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+        set_preview_func = None
+        if lib:
+            set_preview_func = getattr(lib, "set_anim_blueprint_preview_mesh", None)
+            if not callable(set_preview_func):
+                set_preview_func = getattr(lib, "SetAnimBlueprintPreviewMesh", None)
+        if callable(set_preview_func):
+            try:
+                ok = bool(set_preview_func(bp, preview_mesh, False))
+                if not ok:
+                    _log("  PreviewSkeletalMesh update skipped: helper returned false")
+            except Exception as exc:
+                _log(f"  PreviewSkeletalMesh helper failed: {exc}")
+        else:
+            try:
+                bp.set_editor_property("PreviewSkeletalMesh", preview_mesh)
+            except Exception as exc:
+                _log(f"  PreviewSkeletalMesh update skipped: {exc}")
+
+
+def _export_anim_blueprint_metadata(bp):
+    if not bp:
+        return {}
+
+    lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+    if not lib:
+        return {}
+
+    func = getattr(lib, "export_anim_blueprint_metadata_to_json", None)
+    if not callable(func):
+        func = getattr(lib, "ExportAnimBlueprintMetadataToJson", None)
+    if not callable(func):
+        return {}
+
+    try:
+        payload = func(bp)
+    except Exception as exc:
+        _log(f"  AnimBlueprint metadata export failed: {exc}")
+        return {}
+
+    if not payload:
+        return {}
+
+    try:
+        parsed = json.loads(payload)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as exc:
+        _log(f"  AnimBlueprint metadata parse failed: {exc}")
+        return {}
+
+
 def generate_anim_blueprint(json_path: str):
     """Generate an AnimBlueprint from a JSON template."""
     if not os.path.isfile(json_path):
@@ -218,6 +333,22 @@ def generate_anim_blueprint(json_path: str):
         _log(f"Non-UE environment, skipping generation: {name}")
         return False
 
+    target_skeleton = None
+    if target_skeleton_path:
+        target_skeleton = _load_asset(target_skeleton_path)
+        if not target_skeleton:
+            _log_error(f"Failed to load target skeleton: {target_skeleton_path}")
+            return False
+    elif not is_template:
+        _log_error("Child AnimBlueprint templates require TargetSkeleton")
+        return False
+
+    preview_mesh = None
+    if preview_mesh_path:
+        preview_mesh = _load_asset(preview_mesh_path)
+        if not preview_mesh:
+            _log(f"Preview mesh not found, continuing without it: {preview_mesh_path}")
+
     asset_path = output_path + name
     existing = unreal.load_asset(asset_path)
     if existing:
@@ -240,7 +371,9 @@ def generate_anim_blueprint(json_path: str):
                     _log("  Failed to clear existing AnimBlueprint content, continuing with overwrite attempt")
             else:
                 _log("  ResetAnimBlueprintForRegeneration not available, continuing with overwrite attempt")
+        _apply_anim_blueprint_properties(existing, is_template, target_skeleton, preview_mesh)
         _apply_state_machine_definition(existing, template)
+        _apply_animation_overrides(existing, template)
         if unlua_binding:
             _set_unlua_binding(existing, unlua_binding)
         _compile_blueprint(existing)
@@ -251,22 +384,6 @@ def generate_anim_blueprint(json_path: str):
     if not parent_class:
         _log_error(f"Failed to load parent class: {parent_class_path}")
         return False
-
-    target_skeleton = None
-    if target_skeleton_path:
-        target_skeleton = _load_asset(target_skeleton_path)
-        if not target_skeleton:
-            _log_error(f"Failed to load target skeleton: {target_skeleton_path}")
-            return False
-    elif not is_template:
-        _log_error("Child AnimBlueprint templates require TargetSkeleton")
-        return False
-
-    preview_mesh = None
-    if preview_mesh_path:
-        preview_mesh = _load_asset(preview_mesh_path)
-        if not preview_mesh:
-            _log(f"Preview mesh not found, continuing without it: {preview_mesh_path}")
 
     factory = unreal.AnimBlueprintFactory()
     factory.set_editor_property("ParentClass", parent_class)
@@ -282,11 +399,94 @@ def generate_anim_blueprint(json_path: str):
         _log_error(f"Failed to create AnimBlueprint: {asset_path}")
         return False
 
+    _apply_anim_blueprint_properties(anim_bp, is_template, target_skeleton, preview_mesh)
     _apply_state_machine_definition(anim_bp, template)
+    _apply_animation_overrides(anim_bp, template)
     if unlua_binding:
         _set_unlua_binding(anim_bp, unlua_binding)
 
     _compile_blueprint(anim_bp)
     unreal.EditorAssetLibrary.save_asset(asset_path)
     _log(f"AnimBlueprint generated: {asset_path}")
+    return True
+
+
+def export_anim_blueprint(asset_path: str, json_path: str):
+    """Export an existing AnimBlueprint into a JSON template."""
+    if not IN_UE:
+        _log("Non-UE environment, cannot export AnimBlueprint")
+        return False
+
+    bp = unreal.load_asset(asset_path)
+    if not bp or not isinstance(bp, unreal.AnimBlueprint):
+        _log_error(f"Failed to load AnimBlueprint: {asset_path}")
+        return False
+
+    _log(f"Export AnimBlueprint: {asset_path}")
+    existing_template = _load_existing_template(json_path)
+    template = dict(existing_template) if isinstance(existing_template, dict) else {}
+    template["Name"] = bp.get_name()
+    template["OutputPath"] = str(asset_path).rsplit("/", 1)[0] + "/"
+
+    parent_class_path = str(template.get("ParentClass", "") or "")
+    try:
+        parent_class = bp.get_editor_property("ParentClass")
+    except Exception:
+        parent_class = None
+    if parent_class:
+        try:
+            parent_class_path = parent_class.get_path_name()
+        except Exception:
+            parent_class_path = str(parent_class)
+    if parent_class_path:
+        template["ParentClass"] = parent_class_path
+
+    try:
+        template["bTemplate"] = bool(bp.get_editor_property("bTemplate"))
+    except Exception:
+        pass
+
+    try:
+        target_skeleton = bp.get_editor_property("TargetSkeleton")
+    except Exception:
+        target_skeleton = None
+    if target_skeleton:
+        try:
+            template["TargetSkeleton"] = _asset_package_path(target_skeleton)
+        except Exception:
+            pass
+    else:
+        template.pop("TargetSkeleton", None)
+
+    try:
+        preview_mesh = bp.get_editor_property("PreviewSkeletalMesh")
+    except Exception:
+        preview_mesh = None
+    if preview_mesh:
+        try:
+            template["PreviewSkeletalMesh"] = _asset_package_path(preview_mesh)
+        except Exception:
+            pass
+    else:
+        template.pop("PreviewSkeletalMesh", None)
+
+    metadata = _export_anim_blueprint_metadata(bp)
+    if metadata.get("StateMachineDefinition"):
+        template["StateMachineDefinition"] = metadata["StateMachineDefinition"]
+    else:
+        template.pop("StateMachineDefinition", None)
+
+    if metadata.get("AnimationOverrides"):
+        template["AnimationOverrides"] = metadata["AnimationOverrides"]
+    else:
+        template.pop("AnimationOverrides", None)
+
+    if metadata.get("UnLuaBinding"):
+        template["UnLuaBinding"] = metadata["UnLuaBinding"]
+
+    os.makedirs(os.path.dirname(json_path), exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(template, handle, indent=2, ensure_ascii=False)
+
+    _log(f"AnimBlueprint export complete: {json_path}")
     return True

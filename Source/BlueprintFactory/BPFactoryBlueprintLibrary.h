@@ -66,6 +66,18 @@ UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
 static bool SetupAnimStateMachineFromJson(
 	class UAnimBlueprint* AnimBlueprint,
 	const FString& DefinitionJson);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static bool SetupAnimAssetOverridesFromJson(
+	class UAnimBlueprint* AnimBlueprint,
+	const FString& OverridesJson);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static bool SetAnimBlueprintPreviewMesh(
+	class UAnimBlueprint* AnimBlueprint,
+	class USkeletalMesh* PreviewMesh,
+	bool bMarkDirty = true);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static FString ExportAnimBlueprintMetadataToJson(
+	class UAnimBlueprint* AnimBlueprint);
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
 	static bool SetupQuadrupedBeastStateMachine(
 		class UAnimBlueprint* AnimBlueprint,
