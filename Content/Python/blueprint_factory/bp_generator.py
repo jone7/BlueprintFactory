@@ -276,6 +276,7 @@ def generate_blueprint(json_path: str):
 COMPONENT_TYPE_ALIASES = {
     "StaticMesh": "StaticMeshComponent",
     "SkeletalMesh": "SkeletalMeshComponent",
+    "Widget": "WidgetComponent",
     "BoxCollision": "BoxComponent",
     "SphereCollision": "SphereComponent",
     "CapsuleCollision": "CapsuleComponent",
@@ -304,6 +305,7 @@ EXPORT_COMPONENT_TYPE_MAP = {
     "SplineComponent": "Spline",
     "SplineMeshComponent": "SplineMesh",
     "SceneComponent": "SceneComponent",
+    "WidgetComponent": "WidgetComponent",
 }
 
 # 需要特殊属性设置的组件类型
@@ -351,6 +353,20 @@ def _normalize_component_type_for_export(comp):
     if class_name.endswith("Component"):
         return class_name[:-9]
     return class_name
+
+
+def _normalize_animation_mode_for_export(anim_mode):
+    if anim_mode is None:
+        return ""
+
+    text = str(anim_mode)
+    if "ANIMATION_BLUEPRINT" in text:
+        return "UseAnimationBlueprint"
+    if "ANIMATION_SINGLE_NODE" in text:
+        return "UseAnimationAsset"
+    if "ANIMATION_CUSTOM_MODE" in text:
+        return "AnimationCustomMode"
+    return text.split(".")[-1]
 
 
 def _vector_to_list(vec):
@@ -460,7 +476,7 @@ def _export_component_data(node, component_name_to_root):
 
         anim_mode = _safe_get_editor_property(comp, "AnimationMode")
         if anim_mode is not None:
-            comp_data["AnimationMode"] = str(anim_mode).split(".")[-1]
+            comp_data["AnimationMode"] = _normalize_animation_mode_for_export(anim_mode)
 
         anim_class = _safe_get_editor_property(comp, "AnimClass")
         if anim_class:
@@ -629,7 +645,7 @@ def _export_component_data_from_subobject(bp, bfl, data):
 
         anim_mode = _safe_get_editor_property(comp, "AnimationMode")
         if anim_mode is not None:
-            comp_data["AnimationMode"] = str(anim_mode).split(".")[-1]
+            comp_data["AnimationMode"] = _normalize_animation_mode_for_export(anim_mode)
 
         anim_class = _safe_get_editor_property(comp, "AnimClass")
         if anim_class:
