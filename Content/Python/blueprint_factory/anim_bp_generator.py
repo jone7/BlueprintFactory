@@ -243,6 +243,30 @@ def _apply_animation_overrides(bp, template):
         _log("  Animation overrides apply failed")
 
 
+def _apply_output_pose_adjust(bp, template):
+    adjust = template.get("OutputPoseAdjust")
+    if not isinstance(adjust, dict):
+        return
+
+    lib = getattr(unreal, "BPFactoryBlueprintLibrary", None)
+    if not lib:
+        _log("  Output pose adjust skipped: missing BPFactoryBlueprintLibrary")
+        return
+
+    func = getattr(lib, "setup_anim_output_pose_adjust_from_json", None)
+    if not callable(func):
+        func = getattr(lib, "SetupAnimOutputPoseAdjustFromJson", None)
+    if not callable(func):
+        _log("  Output pose adjust skipped: SetupAnimOutputPoseAdjustFromJson not found")
+        return
+
+    ok = bool(func(bp, json.dumps(adjust, ensure_ascii=False)))
+    if ok:
+        _log("  Output pose adjust applied")
+    else:
+        _log("  Output pose adjust apply failed")
+
+
 def _apply_anim_blueprint_properties(bp, is_template, target_skeleton=None, preview_mesh=None):
     if not bp:
         return
@@ -373,6 +397,7 @@ def generate_anim_blueprint(json_path: str):
                 _log("  ResetAnimBlueprintForRegeneration not available, continuing with overwrite attempt")
         _apply_anim_blueprint_properties(existing, is_template, target_skeleton, preview_mesh)
         _apply_state_machine_definition(existing, template)
+        _apply_output_pose_adjust(existing, template)
         _apply_animation_overrides(existing, template)
         if unlua_binding:
             _set_unlua_binding(existing, unlua_binding)
@@ -401,6 +426,7 @@ def generate_anim_blueprint(json_path: str):
 
     _apply_anim_blueprint_properties(anim_bp, is_template, target_skeleton, preview_mesh)
     _apply_state_machine_definition(anim_bp, template)
+    _apply_output_pose_adjust(anim_bp, template)
     _apply_animation_overrides(anim_bp, template)
     if unlua_binding:
         _set_unlua_binding(anim_bp, unlua_binding)
@@ -480,6 +506,11 @@ def export_anim_blueprint(asset_path: str, json_path: str):
         template["AnimationOverrides"] = metadata["AnimationOverrides"]
     else:
         template.pop("AnimationOverrides", None)
+
+    if metadata.get("OutputPoseAdjust"):
+        template["OutputPoseAdjust"] = metadata["OutputPoseAdjust"]
+    else:
+        template.pop("OutputPoseAdjust", None)
 
     if metadata.get("UnLuaBinding"):
         template["UnLuaBinding"] = metadata["UnLuaBinding"]

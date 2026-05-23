@@ -4,6 +4,9 @@
 #include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_SequencePlayer.h"
 #include "AnimGraphNode_Slot.h"
+#include "AnimGraphNode_ComponentToLocalSpace.h"
+#include "AnimGraphNode_LocalToComponentSpace.h"
+#include "AnimGraphNode_ModifyBone.h"
 #include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateMachineBase.h"
@@ -33,10 +36,12 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
+#include "UObject/UnrealType.h"
 #include "Dom/JsonObject.h"
 #include "Misc/PackageName.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Animation/AnimTypes.h"
 
 #if WITH_UNLUA
 #include "UnLuaInterface.h"
@@ -103,6 +108,14 @@ namespace
 	{
 		FName StateName;
 		FString AnimationAssetPath;
+	};
+
+	struct FAnimOutputPoseAdjustDefinition
+	{
+		FName BoneName = TEXT("root");
+		FVector LocationOffset = FVector::ZeroVector;
+		FRotator RotationOffset = FRotator::ZeroRotator;
+		FVector Scale = FVector(1.0f, 1.0f, 1.0f);
 	};
 
 	FString ToObjectPath(const FString& AssetPath)
@@ -186,6 +199,22 @@ namespace
 		return PinType;
 	}
 
+	FEdGraphPinType MakeVectorPinType()
+	{
+		FEdGraphPinType PinType;
+		PinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+		PinType.PinSubCategoryObject = TBaseStructure<FVector>::Get();
+		return PinType;
+	}
+
+	FEdGraphPinType MakeRotatorPinType()
+	{
+		FEdGraphPinType PinType;
+		PinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+		PinType.PinSubCategoryObject = TBaseStructure<FRotator>::Get();
+		return PinType;
+	}
+
 	bool TryMakePinTypeFromString(const FString& TypeName, FEdGraphPinType& OutPinType)
 	{
 		const FString Normalized = TypeName.TrimStartAndEnd().ToLower();
@@ -207,6 +236,18 @@ namespace
 			return true;
 		}
 
+		if (Normalized == TEXT("vector"))
+		{
+			OutPinType = MakeVectorPinType();
+			return true;
+		}
+
+		if (Normalized == TEXT("rotator"))
+		{
+			OutPinType = MakeRotatorPinType();
+			return true;
+		}
+
 		return false;
 	}
 
@@ -224,6 +265,18 @@ namespace
 				return TEXT("double");
 			}
 			return TEXT("float");
+		}
+
+		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Struct)
+		{
+			if (PinType.PinSubCategoryObject == TBaseStructure<FVector>::Get())
+			{
+				return TEXT("vector");
+			}
+			if (PinType.PinSubCategoryObject == TBaseStructure<FRotator>::Get())
+			{
+				return TEXT("rotator");
+			}
 		}
 
 		return FString();
@@ -296,6 +349,30 @@ namespace
 		FBlueprintEditorUtils::AddMemberVariable(Blueprint, VarName, PinType);
 	}
 
+	void EnsureMemberVariable(UBlueprint* Blueprint, const FName VarName, const FEdGraphPinType& PinType, const FString& DefaultValue)
+	{
+		if (!Blueprint)
+		{
+			return;
+		}
+
+		if (!HasMemberVariable(Blueprint, VarName))
+		{
+			FBlueprintEditorUtils::AddMemberVariable(Blueprint, VarName, PinType, DefaultValue);
+			return;
+		}
+
+		const int32 ExistingIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarName);
+		if (ExistingIndex != INDEX_NONE && !DefaultValue.IsEmpty())
+		{
+			FBPVariableDescription& VariableDescription = Blueprint->NewVariables[ExistingIndex];
+			if (VariableDescription.DefaultValue != DefaultValue)
+			{
+				VariableDescription.DefaultValue = DefaultValue;
+			}
+		}
+	}
+
 	void EnsureDeclaredVariables(UBlueprint* Blueprint, const TArray<FAnimStateMachineVariableSpec>& VariableSpecs)
 	{
 		if (!Blueprint)
@@ -317,7 +394,7 @@ namespace
 				continue;
 			}
 
-			EnsureMemberVariable(Blueprint, VarSpec.Name, PinType);
+			EnsureMemberVariable(Blueprint, VarSpec.Name, PinType, FString());
 		}
 	}
 
@@ -361,6 +438,76 @@ namespace
 			const double X = (*PositionArray)[0].IsValid() ? (*PositionArray)[0]->AsNumber() : 0.0;
 			const double Y = (*PositionArray)[1].IsValid() ? (*PositionArray)[1]->AsNumber() : 0.0;
 			OutVector = FVector2f(static_cast<float>(X), static_cast<float>(Y));
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryReadVector(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName, FVector& OutVector)
+	{
+		if (!JsonObject.IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* VectorObject = nullptr;
+		if (JsonObject->TryGetObjectField(FieldName, VectorObject) && VectorObject && VectorObject->IsValid())
+		{
+			double X = 0.0;
+			double Y = 0.0;
+			double Z = 0.0;
+			if ((*VectorObject)->TryGetNumberField(TEXT("X"), X)
+				&& (*VectorObject)->TryGetNumberField(TEXT("Y"), Y)
+				&& (*VectorObject)->TryGetNumberField(TEXT("Z"), Z))
+			{
+				OutVector = FVector(X, Y, Z);
+				return true;
+			}
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* VectorArray = nullptr;
+		if (JsonObject->TryGetArrayField(FieldName, VectorArray) && VectorArray && VectorArray->Num() >= 3)
+		{
+			const double X = (*VectorArray)[0].IsValid() ? (*VectorArray)[0]->AsNumber() : 0.0;
+			const double Y = (*VectorArray)[1].IsValid() ? (*VectorArray)[1]->AsNumber() : 0.0;
+			const double Z = (*VectorArray)[2].IsValid() ? (*VectorArray)[2]->AsNumber() : 0.0;
+			OutVector = FVector(X, Y, Z);
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryReadRotator(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName, FRotator& OutRotator)
+	{
+		if (!JsonObject.IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* RotatorObject = nullptr;
+		if (JsonObject->TryGetObjectField(FieldName, RotatorObject) && RotatorObject && RotatorObject->IsValid())
+		{
+			double Pitch = 0.0;
+			double Yaw = 0.0;
+			double Roll = 0.0;
+			if ((*RotatorObject)->TryGetNumberField(TEXT("Pitch"), Pitch)
+				&& (*RotatorObject)->TryGetNumberField(TEXT("Yaw"), Yaw)
+				&& (*RotatorObject)->TryGetNumberField(TEXT("Roll"), Roll))
+			{
+				OutRotator = FRotator(Pitch, Yaw, Roll);
+				return true;
+			}
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* RotatorArray = nullptr;
+		if (JsonObject->TryGetArrayField(FieldName, RotatorArray) && RotatorArray && RotatorArray->Num() >= 3)
+		{
+			const double Pitch = (*RotatorArray)[0].IsValid() ? (*RotatorArray)[0]->AsNumber() : 0.0;
+			const double Yaw = (*RotatorArray)[1].IsValid() ? (*RotatorArray)[1]->AsNumber() : 0.0;
+			const double Roll = (*RotatorArray)[2].IsValid() ? (*RotatorArray)[2]->AsNumber() : 0.0;
+			OutRotator = FRotator(Pitch, Yaw, Roll);
 			return true;
 		}
 
@@ -614,6 +761,34 @@ namespace
 		return true;
 	}
 
+	bool ParseOutputPoseAdjustJson(const FString& AdjustJson, FAnimOutputPoseAdjustDefinition& OutDefinition)
+	{
+		if (AdjustJson.IsEmpty())
+		{
+			return false;
+		}
+
+		TSharedPtr<FJsonObject> RootObject;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(AdjustJson);
+		if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+		{
+			return false;
+		}
+
+		OutDefinition = FAnimOutputPoseAdjustDefinition();
+
+		FString BoneName;
+		if (RootObject->TryGetStringField(TEXT("BoneName"), BoneName) && !BoneName.IsEmpty())
+		{
+			OutDefinition.BoneName = FName(*BoneName);
+		}
+
+		TryReadVector(RootObject, TEXT("LocationOffset"), OutDefinition.LocationOffset);
+		TryReadRotator(RootObject, TEXT("RotationOffset"), OutDefinition.RotationOffset);
+		TryReadVector(RootObject, TEXT("Scale"), OutDefinition.Scale);
+		return true;
+	}
+
 	UEdGraphPin* FindFirstPin(UEdGraphNode* Node, EEdGraphPinDirection Direction)
 	{
 		if (!Node)
@@ -624,6 +799,23 @@ namespace
 		for (UEdGraphPin* Pin : Node->Pins)
 		{
 			if (Pin && Pin->Direction == Direction)
+			{
+				return Pin;
+			}
+		}
+		return nullptr;
+	}
+
+	UEdGraphPin* FindPinByName(UEdGraphNode* Node, const EEdGraphPinDirection Direction, const FName PinName)
+	{
+		if (!Node || PinName.IsNone())
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->Direction == Direction && Pin->PinName == PinName)
 			{
 				return Pin;
 			}
@@ -769,11 +961,309 @@ namespace
 		return SlotNode;
 	}
 
+	UAnimGraphNode_LocalToComponentSpace* FindLocalToComponentNode(UEdGraph* Graph)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (UAnimGraphNode_LocalToComponentSpace* LocalToComponentNode = Cast<UAnimGraphNode_LocalToComponentSpace>(Node))
+			{
+				return LocalToComponentNode;
+			}
+		}
+		return nullptr;
+	}
+
+	UAnimGraphNode_LocalToComponentSpace* EnsureLocalToComponentNode(UEdGraph* AnimGraph)
+	{
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		if (UAnimGraphNode_LocalToComponentSpace* Existing = FindLocalToComponentNode(AnimGraph))
+		{
+			return Existing;
+		}
+
+		FGraphNodeCreator<UAnimGraphNode_LocalToComponentSpace> NodeCreator(*AnimGraph);
+		UAnimGraphNode_LocalToComponentSpace* NewNode = NodeCreator.CreateNode();
+		NodeCreator.Finalize();
+		if (!NewNode)
+		{
+			return nullptr;
+		}
+
+		NewNode->NodePosX = -96;
+		NewNode->NodePosY = 64;
+		return NewNode;
+	}
+
+	UAnimGraphNode_ModifyBone* FindModifyBoneNode(UEdGraph* Graph)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (UAnimGraphNode_ModifyBone* ModifyBoneNode = Cast<UAnimGraphNode_ModifyBone>(Node))
+			{
+				return ModifyBoneNode;
+			}
+		}
+		return nullptr;
+	}
+
+	UAnimGraphNode_ModifyBone* EnsureModifyBoneNode(UEdGraph* AnimGraph)
+	{
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		if (UAnimGraphNode_ModifyBone* Existing = FindModifyBoneNode(AnimGraph))
+		{
+			return Existing;
+		}
+
+		FGraphNodeCreator<UAnimGraphNode_ModifyBone> NodeCreator(*AnimGraph);
+		UAnimGraphNode_ModifyBone* NewNode = NodeCreator.CreateNode();
+		NodeCreator.Finalize();
+		if (!NewNode)
+		{
+			return nullptr;
+		}
+
+		NewNode->NodePosX = 80;
+		NewNode->NodePosY = 64;
+		return NewNode;
+	}
+
+	UAnimGraphNode_ComponentToLocalSpace* FindComponentToLocalNode(UEdGraph* Graph)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (UAnimGraphNode_ComponentToLocalSpace* ComponentToLocalNode = Cast<UAnimGraphNode_ComponentToLocalSpace>(Node))
+			{
+				return ComponentToLocalNode;
+			}
+		}
+		return nullptr;
+	}
+
+	UAnimGraphNode_ComponentToLocalSpace* EnsureComponentToLocalNode(UEdGraph* AnimGraph)
+	{
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		if (UAnimGraphNode_ComponentToLocalSpace* Existing = FindComponentToLocalNode(AnimGraph))
+		{
+			return Existing;
+		}
+
+		FGraphNodeCreator<UAnimGraphNode_ComponentToLocalSpace> NodeCreator(*AnimGraph);
+		UAnimGraphNode_ComponentToLocalSpace* NewNode = NodeCreator.CreateNode();
+		NodeCreator.Finalize();
+		if (!NewNode)
+		{
+			return nullptr;
+		}
+
+		NewNode->NodePosX = 256;
+		NewNode->NodePosY = 64;
+		return NewNode;
+	}
+
+	UEdGraphPin* FindUpstreamPoseInputPin(UEdGraphNode* Node)
+	{
+		if (!Node)
+		{
+			return nullptr;
+		}
+
+		if (Cast<UAnimGraphNode_ModifyBone>(Node))
+		{
+			return FindPinByName(Node, EGPD_Input, TEXT("ComponentPose"));
+		}
+
+		if (Cast<UAnimGraphNode_LocalToComponentSpace>(Node))
+		{
+			return FindPinByName(Node, EGPD_Input, TEXT("LocalPose"));
+		}
+
+		if (Cast<UAnimGraphNode_ComponentToLocalSpace>(Node))
+		{
+			return FindPinByName(Node, EGPD_Input, TEXT("ComponentPose"));
+		}
+
+		return FindFirstPin(Node, EGPD_Input);
+	}
+
+	UEdGraphNode* FindDirectUpstreamNode(UEdGraphNode* Node)
+	{
+		if (UEdGraphPin* InputPin = FindUpstreamPoseInputPin(Node))
+		{
+			if (InputPin->LinkedTo.Num() > 0 && InputPin->LinkedTo[0])
+			{
+				return InputPin->LinkedTo[0]->GetOwningNode();
+			}
+		}
+		return nullptr;
+	}
+
+	template <typename NodeType>
+	NodeType* FindUpstreamNodeOfClass(UEdGraphNode* Node)
+	{
+		TSet<UEdGraphNode*> VisitedNodes;
+		UEdGraphNode* CurrentNode = Node;
+		while (CurrentNode && !VisitedNodes.Contains(CurrentNode))
+		{
+			VisitedNodes.Add(CurrentNode);
+			if (NodeType* Match = Cast<NodeType>(CurrentNode))
+			{
+				return Match;
+			}
+			CurrentNode = FindDirectUpstreamNode(CurrentNode);
+		}
+		return nullptr;
+	}
+
+	void ConfigureModifyBoneNode(UAnimGraphNode_ModifyBone* ModifyBoneNode, const FAnimOutputPoseAdjustDefinition& Definition)
+	{
+		if (!ModifyBoneNode)
+		{
+			return;
+		}
+
+		ModifyBoneNode->Node.BoneToModify.BoneName = Definition.BoneName.IsNone() ? TEXT("root") : Definition.BoneName;
+		ModifyBoneNode->Node.Translation = Definition.LocationOffset;
+		ModifyBoneNode->Node.Rotation = Definition.RotationOffset;
+		ModifyBoneNode->Node.Scale = Definition.Scale;
+		ModifyBoneNode->Node.TranslationMode = BMM_Additive;
+		ModifyBoneNode->Node.RotationMode = BMM_Additive;
+		ModifyBoneNode->Node.ScaleMode = BMM_Replace;
+		ModifyBoneNode->Node.TranslationSpace = BCS_ComponentSpace;
+		ModifyBoneNode->Node.RotationSpace = BCS_ComponentSpace;
+		ModifyBoneNode->Node.ScaleSpace = BCS_WorldSpace;
+		ModifyBoneNode->ReconstructNode();
+	}
+
+	FString FormatVectorDefaultValue(const FVector& Vector)
+	{
+		return FString::Printf(TEXT("(X=%0.6f,Y=%0.6f,Z=%0.6f)"), Vector.X, Vector.Y, Vector.Z);
+	}
+
+	FString FormatRotatorDefaultValue(const FRotator& Rotator)
+	{
+		return FString::Printf(TEXT("(Pitch=%0.6f,Yaw=%0.6f,Roll=%0.6f)"), Rotator.Pitch, Rotator.Yaw, Rotator.Roll);
+	}
+
+	void EnsureOutputPoseAdjustVariables(UAnimBlueprint* AnimBlueprint, const FAnimOutputPoseAdjustDefinition& Definition)
+	{
+		if (!AnimBlueprint)
+		{
+			return;
+		}
+
+		EnsureMemberVariable(AnimBlueprint, TEXT("LocationOffset"), MakeVectorPinType(), FormatVectorDefaultValue(Definition.LocationOffset));
+		EnsureMemberVariable(AnimBlueprint, TEXT("RotationOffset"), MakeRotatorPinType(), FormatRotatorDefaultValue(Definition.RotationOffset));
+		EnsureMemberVariable(AnimBlueprint, TEXT("Scale"), MakeVectorPinType(), FormatVectorDefaultValue(Definition.Scale));
+	}
+
+	bool BindAnimGraphNodePinToBlueprintVariable(UAnimGraphNode_Base* AnimGraphNode, const FName PinName, const FName VariableName)
+	{
+		if (!AnimGraphNode || PinName.IsNone() || VariableName.IsNone())
+		{
+			return false;
+		}
+
+		UAnimBlueprint* AnimBlueprint = AnimGraphNode->GetAnimBlueprint();
+		if (!AnimBlueprint || !AnimBlueprint->SkeletonGeneratedClass)
+		{
+			return false;
+		}
+
+		UObject* BindingObject = reinterpret_cast<UObject*>(AnimGraphNode->GetMutableBinding());
+		if (!BindingObject)
+		{
+			AnimGraphNode->ReconstructNode();
+			BindingObject = reinterpret_cast<UObject*>(AnimGraphNode->GetMutableBinding());
+		}
+		if (!BindingObject)
+		{
+			return false;
+		}
+
+		FMapProperty* PropertyBindingsProperty = FindFProperty<FMapProperty>(BindingObject->GetClass(), TEXT("PropertyBindings"));
+		if (!PropertyBindingsProperty)
+		{
+			return false;
+		}
+
+		void* MapContainer = PropertyBindingsProperty->ContainerPtrToValuePtr<void>(BindingObject);
+		FScriptMapHelper MapHelper(PropertyBindingsProperty, MapContainer);
+		int32 EntryIndex = MapHelper.FindMapIndexWithKey(&PinName);
+		if (EntryIndex == INDEX_NONE)
+		{
+			EntryIndex = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
+			CastFieldChecked<FNameProperty>(PropertyBindingsProperty->KeyProp)->SetPropertyValue(MapHelper.GetKeyPtr(EntryIndex), PinName);
+		}
+
+		FAnimGraphNodePropertyBinding BindingValue;
+		BindingValue.PropertyName = PinName;
+		BindingValue.PropertyPath = { VariableName.ToString() };
+		BindingValue.PathAsText = FText::FromString(VariableName.ToString());
+		BindingValue.Type = EAnimGraphNodePropertyBindingType::Property;
+		BindingValue.bIsBound = true;
+		BindingValue.bIsPromotion = false;
+		BindingValue.ContextId = NAME_None;
+		BindingValue.ArrayIndex = INDEX_NONE;
+
+		if (FProperty* VariableProperty = FindFProperty<FProperty>(AnimBlueprint->SkeletonGeneratedClass, VariableName))
+		{
+			GetDefault<UAnimationGraphSchema>()->ConvertPropertyToPinType(VariableProperty, BindingValue.PinType);
+			BindingValue.PromotedPinType = BindingValue.PinType;
+		}
+
+		CastFieldChecked<FStructProperty>(PropertyBindingsProperty->ValueProp)->CopyCompleteValue(MapHelper.GetValuePtr(EntryIndex), &BindingValue);
+		MapHelper.Rehash();
+		BindingObject->Modify();
+		AnimGraphNode->Modify();
+		AnimGraphNode->ReconstructNode();
+		return true;
+	}
+
+	void BindOutputPoseAdjustPins(UAnimGraphNode_ModifyBone* ModifyBoneNode)
+	{
+		if (!ModifyBoneNode)
+		{
+			return;
+		}
+
+		BindAnimGraphNodePinToBlueprintVariable(ModifyBoneNode, TEXT("Translation"), TEXT("LocationOffset"));
+		BindAnimGraphNodePinToBlueprintVariable(ModifyBoneNode, TEXT("Rotation"), TEXT("RotationOffset"));
+		BindAnimGraphNodePinToBlueprintVariable(ModifyBoneNode, TEXT("Scale"), TEXT("Scale"));
+	}
+
 	void ConnectStateMachineToOutput(
 		UBlueprint* Blueprint,
 		UEdGraph* AnimGraph,
 		UAnimGraphNode_StateMachineBase* StateMachineNode,
-		const FAnimStateMachineDefinition& Definition)
+		const FAnimStateMachineDefinition& Definition,
+		const FAnimOutputPoseAdjustDefinition* OutputPoseAdjust)
 	{
 		if (!Blueprint || !AnimGraph || !StateMachineNode)
 		{
@@ -798,6 +1288,7 @@ namespace
 			RootIn->BreakAllPinLinks();
 		}
 
+		UEdGraphPin* UpstreamOut = StateMachineOut;
 		if (!Definition.OutputSlotName.IsNone())
 		{
 			if (UAnimGraphNode_Slot* SlotNode = EnsureSlotNode(AnimGraph, Definition.OutputSlotName, Definition.bAlwaysUpdateSourcePose))
@@ -811,13 +1302,51 @@ namespace
 						SlotIn->BreakAllPinLinks();
 					}
 					AnimGraph->GetSchema()->TryCreateConnection(StateMachineOut, SlotIn);
-					AnimGraph->GetSchema()->TryCreateConnection(SlotOut, RootIn);
+					UpstreamOut = SlotOut;
+				}
+			}
+		}
+
+		if (OutputPoseAdjust)
+		{
+			UAnimGraphNode_LocalToComponentSpace* LocalToComponentNode = EnsureLocalToComponentNode(AnimGraph);
+			UAnimGraphNode_ModifyBone* ModifyBoneNode = EnsureModifyBoneNode(AnimGraph);
+			UAnimGraphNode_ComponentToLocalSpace* ComponentToLocalNode = EnsureComponentToLocalNode(AnimGraph);
+			if (LocalToComponentNode && ModifyBoneNode && ComponentToLocalNode)
+			{
+				ConfigureModifyBoneNode(ModifyBoneNode, *OutputPoseAdjust);
+
+				UEdGraphPin* LocalToComponentIn = FindPinByName(LocalToComponentNode, EGPD_Input, TEXT("LocalPose"));
+				UEdGraphPin* LocalToComponentOut = FindPinByName(LocalToComponentNode, EGPD_Output, TEXT("ComponentPose"));
+				UEdGraphPin* ModifyBoneIn = FindPinByName(ModifyBoneNode, EGPD_Input, TEXT("ComponentPose"));
+				UEdGraphPin* ModifyBoneOut = FindPinByName(ModifyBoneNode, EGPD_Output, TEXT("Pose"));
+				UEdGraphPin* ComponentToLocalIn = FindPinByName(ComponentToLocalNode, EGPD_Input, TEXT("ComponentPose"));
+				UEdGraphPin* ComponentToLocalOut = FindFirstPin(ComponentToLocalNode, EGPD_Output);
+				if (LocalToComponentIn && LocalToComponentOut && ModifyBoneIn && ModifyBoneOut && ComponentToLocalIn && ComponentToLocalOut)
+				{
+					if (LocalToComponentIn->LinkedTo.Num() > 0)
+					{
+						LocalToComponentIn->BreakAllPinLinks();
+					}
+					if (ModifyBoneIn->LinkedTo.Num() > 0)
+					{
+						ModifyBoneIn->BreakAllPinLinks();
+					}
+					if (ComponentToLocalIn->LinkedTo.Num() > 0)
+					{
+						ComponentToLocalIn->BreakAllPinLinks();
+					}
+
+					AnimGraph->GetSchema()->TryCreateConnection(UpstreamOut, LocalToComponentIn);
+					AnimGraph->GetSchema()->TryCreateConnection(LocalToComponentOut, ModifyBoneIn);
+					AnimGraph->GetSchema()->TryCreateConnection(ModifyBoneOut, ComponentToLocalIn);
+					AnimGraph->GetSchema()->TryCreateConnection(ComponentToLocalOut, RootIn);
 					return;
 				}
 			}
 		}
 
-		AnimGraph->GetSchema()->TryCreateConnection(StateMachineOut, RootIn);
+		AnimGraph->GetSchema()->TryCreateConnection(UpstreamOut, RootIn);
 	}
 
 	void ClearStateMachineGraph(UBlueprint* Blueprint, UEdGraph* StateMachineGraph)
@@ -1390,40 +1919,11 @@ namespace
 			return nullptr;
 		}
 
-		UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph);
-		if (RootNode)
+		if (UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph))
 		{
-			if (UEdGraphPin* RootIn = FindFirstPin(RootNode, EGPD_Input))
+			if (UAnimGraphNode_StateMachineBase* StateMachineNode = FindUpstreamNodeOfClass<UAnimGraphNode_StateMachineBase>(RootNode))
 			{
-				for (UEdGraphPin* LinkedPin : RootIn->LinkedTo)
-				{
-					if (!LinkedPin)
-					{
-						continue;
-					}
-
-					if (UAnimGraphNode_StateMachineBase* DirectStateMachine = Cast<UAnimGraphNode_StateMachineBase>(LinkedPin->GetOwningNode()))
-					{
-						return DirectStateMachine;
-					}
-
-					if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(LinkedPin->GetOwningNode()))
-					{
-						if (UEdGraphPin* SlotSource = FindFirstPin(SlotNode, EGPD_Input))
-						{
-							for (UEdGraphPin* SlotLinkedPin : SlotSource->LinkedTo)
-							{
-								if (SlotLinkedPin)
-								{
-									if (UAnimGraphNode_StateMachineBase* IndirectStateMachine = Cast<UAnimGraphNode_StateMachineBase>(SlotLinkedPin->GetOwningNode()))
-									{
-										return IndirectStateMachine;
-									}
-								}
-							}
-						}
-					}
-				}
+				return StateMachineNode;
 			}
 		}
 
@@ -1447,18 +1947,9 @@ namespace
 
 		if (UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph))
 		{
-			if (UEdGraphPin* RootIn = FindFirstPin(RootNode, EGPD_Input))
+			if (UAnimGraphNode_Slot* SlotNode = FindUpstreamNodeOfClass<UAnimGraphNode_Slot>(RootNode))
 			{
-				for (UEdGraphPin* LinkedPin : RootIn->LinkedTo)
-				{
-					if (LinkedPin)
-					{
-						if (UAnimGraphNode_Slot* SlotNode = Cast<UAnimGraphNode_Slot>(LinkedPin->GetOwningNode()))
-						{
-							return SlotNode;
-						}
-					}
-				}
+				return SlotNode;
 			}
 		}
 
@@ -1861,6 +2352,82 @@ namespace
 		return DefinitionObject;
 	}
 
+	TSharedPtr<FJsonObject> MakeVectorObject(const FVector& Vector)
+	{
+		TSharedPtr<FJsonObject> VectorObject = MakeShared<FJsonObject>();
+		VectorObject->SetNumberField(TEXT("X"), Vector.X);
+		VectorObject->SetNumberField(TEXT("Y"), Vector.Y);
+		VectorObject->SetNumberField(TEXT("Z"), Vector.Z);
+		return VectorObject;
+	}
+
+	TSharedPtr<FJsonObject> MakeRotatorObject(const FRotator& Rotator)
+	{
+		TSharedPtr<FJsonObject> RotatorObject = MakeShared<FJsonObject>();
+		RotatorObject->SetNumberField(TEXT("Pitch"), Rotator.Pitch);
+		RotatorObject->SetNumberField(TEXT("Yaw"), Rotator.Yaw);
+		RotatorObject->SetNumberField(TEXT("Roll"), Rotator.Roll);
+		return RotatorObject;
+	}
+
+	TSharedPtr<FJsonObject> BuildOutputPoseAdjustObject(UAnimBlueprint* AnimBlueprint)
+	{
+		UEdGraph* AnimGraph = FindAnimGraph(AnimBlueprint);
+		if (!AnimGraph)
+		{
+			return nullptr;
+		}
+
+		UAnimGraphNode_Root* RootNode = FindRootNode(AnimGraph);
+		UAnimGraphNode_ModifyBone* ModifyBoneNode = RootNode
+			? FindUpstreamNodeOfClass<UAnimGraphNode_ModifyBone>(RootNode)
+			: nullptr;
+		if (!ModifyBoneNode || ModifyBoneNode->Node.BoneToModify.BoneName.IsNone())
+		{
+			return nullptr;
+		}
+
+		TSharedPtr<FJsonObject> AdjustObject = MakeShared<FJsonObject>();
+		AdjustObject->SetStringField(TEXT("BoneName"), ModifyBoneNode->Node.BoneToModify.BoneName.ToString());
+
+		FVector LocationOffset = ModifyBoneNode->Node.Translation;
+		FRotator RotationOffset = ModifyBoneNode->Node.Rotation;
+		FVector ScaleOffset = ModifyBoneNode->Node.Scale;
+
+		if (AnimBlueprint->GeneratedClass)
+		{
+			if (const UObject* CDO = AnimBlueprint->GeneratedClass->GetDefaultObject(false))
+			{
+				if (const FStructProperty* LocationProperty = FindFProperty<FStructProperty>(AnimBlueprint->GeneratedClass, TEXT("LocationOffset")))
+				{
+					if (LocationProperty->Struct == TBaseStructure<FVector>::Get())
+					{
+						LocationOffset = *LocationProperty->ContainerPtrToValuePtr<FVector>(CDO);
+					}
+				}
+				if (const FStructProperty* RotationProperty = FindFProperty<FStructProperty>(AnimBlueprint->GeneratedClass, TEXT("RotationOffset")))
+				{
+					if (RotationProperty->Struct == TBaseStructure<FRotator>::Get())
+					{
+						RotationOffset = *RotationProperty->ContainerPtrToValuePtr<FRotator>(CDO);
+					}
+				}
+				if (const FStructProperty* ScaleProperty = FindFProperty<FStructProperty>(AnimBlueprint->GeneratedClass, TEXT("Scale")))
+				{
+					if (ScaleProperty->Struct == TBaseStructure<FVector>::Get())
+					{
+						ScaleOffset = *ScaleProperty->ContainerPtrToValuePtr<FVector>(CDO);
+					}
+				}
+			}
+		}
+
+		AdjustObject->SetObjectField(TEXT("LocationOffset"), MakeVectorObject(LocationOffset));
+		AdjustObject->SetObjectField(TEXT("RotationOffset"), MakeRotatorObject(RotationOffset));
+		AdjustObject->SetObjectField(TEXT("Scale"), MakeVectorObject(ScaleOffset));
+		return AdjustObject;
+	}
+
 	TArray<TSharedPtr<FJsonValue>> BuildAnimationOverridesArray(UAnimBlueprint* AnimBlueprint)
 	{
 		TArray<TSharedPtr<FJsonValue>> OverrideValues;
@@ -1893,7 +2460,10 @@ namespace
 		return OverrideValues;
 	}
 
-	bool ApplyStateMachineDefinition(UAnimBlueprint* AnimBlueprint, const FAnimStateMachineDefinition& Definition)
+	bool ApplyStateMachineDefinition(
+		UAnimBlueprint* AnimBlueprint,
+		const FAnimStateMachineDefinition& Definition,
+		const FAnimOutputPoseAdjustDefinition* OutputPoseAdjust = nullptr)
 	{
 		if (!AnimBlueprint)
 		{
@@ -1932,7 +2502,7 @@ namespace
 			return false;
 		}
 
-		ConnectStateMachineToOutput(AnimBlueprint, AnimGraph, StateMachineNode, Definition);
+		ConnectStateMachineToOutput(AnimBlueprint, AnimGraph, StateMachineNode, Definition, OutputPoseAdjust);
 		ClearStateMachineGraph(AnimBlueprint, StateMachineGraph);
 
 		TMap<FName, UAnimStateNode*> CreatedStates;
@@ -2004,6 +2574,51 @@ namespace
 			}
 		}
 
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
+		CompileBlueprint(AnimBlueprint);
+		return true;
+	}
+
+	bool ApplyOutputPoseAdjustDefinition(UAnimBlueprint* AnimBlueprint, const FAnimOutputPoseAdjustDefinition& Definition)
+	{
+		if (!AnimBlueprint)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] ApplyOutputPoseAdjustDefinition failed: AnimBlueprint is null"));
+			return false;
+		}
+
+		EnsureOutputPoseAdjustVariables(AnimBlueprint, Definition);
+		CompileBlueprint(AnimBlueprint);
+
+		UEdGraph* AnimGraph = FindAnimGraph(AnimBlueprint);
+		if (!AnimGraph)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] ApplyOutputPoseAdjustDefinition failed: AnimGraph not found on %s"), *AnimBlueprint->GetName());
+			return false;
+		}
+
+		UAnimGraphNode_StateMachineBase* StateMachineNode = FindPrimaryStateMachineNode(AnimGraph);
+		if (!StateMachineNode)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[BPFactory] ApplyOutputPoseAdjustDefinition failed: no primary state machine found"));
+			return false;
+		}
+
+		FAnimStateMachineDefinition ExistingDefinition;
+		ExistingDefinition.StateMachineName = StateMachineNode->EditorStateMachineGraph
+			? StateMachineNode->EditorStateMachineGraph->GetFName()
+			: TEXT("StateMachine");
+		if (UAnimGraphNode_Slot* SlotNode = FindPrimaryOutputSlotNode(AnimGraph))
+		{
+			ExistingDefinition.OutputSlotName = SlotNode->Node.SlotName;
+			ExistingDefinition.bAlwaysUpdateSourcePose = SlotNode->Node.bAlwaysUpdateSourcePose;
+		}
+
+		ConnectStateMachineToOutput(AnimBlueprint, AnimGraph, StateMachineNode, ExistingDefinition, &Definition);
+		if (UAnimGraphNode_ModifyBone* ModifyBoneNode = FindUpstreamNodeOfClass<UAnimGraphNode_ModifyBone>(FindRootNode(AnimGraph)))
+		{
+			BindOutputPoseAdjustPins(ModifyBoneNode);
+		}
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBlueprint);
 		CompileBlueprint(AnimBlueprint);
 		return true;
@@ -2408,6 +3023,26 @@ bool UBPFactoryBlueprintLibrary::SetupAnimAssetOverridesFromJson(
 	return true;
 }
 
+bool UBPFactoryBlueprintLibrary::SetupAnimOutputPoseAdjustFromJson(
+	UAnimBlueprint* AnimBlueprint,
+	const FString& AdjustJson)
+{
+	if (!AnimBlueprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BPFactory] SetupAnimOutputPoseAdjustFromJson failed: AnimBlueprint is null"));
+		return false;
+	}
+
+	FAnimOutputPoseAdjustDefinition Definition;
+	if (!ParseOutputPoseAdjustJson(AdjustJson, Definition))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[BPFactory] SetupAnimOutputPoseAdjustFromJson failed: invalid adjust json"));
+		return false;
+	}
+
+	return ApplyOutputPoseAdjustDefinition(AnimBlueprint, Definition);
+}
+
 bool UBPFactoryBlueprintLibrary::SetAnimBlueprintPreviewMesh(
 	UAnimBlueprint* AnimBlueprint,
 	USkeletalMesh* PreviewMesh,
@@ -2448,6 +3083,10 @@ FString UBPFactoryBlueprintLibrary::ExportAnimBlueprintMetadataToJson(
 		if (TSharedPtr<FJsonObject> StateMachineDefinition = BuildStateMachineDefinitionObject(AnimBlueprint))
 		{
 			RootObject->SetObjectField(TEXT("StateMachineDefinition"), StateMachineDefinition);
+		}
+		if (TSharedPtr<FJsonObject> OutputPoseAdjust = BuildOutputPoseAdjustObject(AnimBlueprint))
+		{
+			RootObject->SetObjectField(TEXT("OutputPoseAdjust"), OutputPoseAdjust);
 		}
 	}
 

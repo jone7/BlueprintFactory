@@ -71,6 +71,10 @@ static bool SetupAnimAssetOverridesFromJson(
 	class UAnimBlueprint* AnimBlueprint,
 	const FString& OverridesJson);
 UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
+static bool SetupAnimOutputPoseAdjustFromJson(
+	class UAnimBlueprint* AnimBlueprint,
+	const FString& AdjustJson);
+UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|AnimBlueprint")
 static bool SetAnimBlueprintPreviewMesh(
 	class UAnimBlueprint* AnimBlueprint,
 	class USkeletalMesh* PreviewMesh,
