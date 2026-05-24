@@ -651,7 +651,7 @@ def _export_material_instance(mi, asset_path, json_path):
     template = {
         "Name": mi.get_name(),
         "Type": "MaterialInstance",
-        "Parent": "",
+        "ParentMaterial": "",
         "OutputPath": str(asset_path).rsplit("/", 1)[0] + "/",
         "Textures": {},
         "Parameters": {},
@@ -659,7 +659,7 @@ def _export_material_instance(mi, asset_path, json_path):
 
     parent = mi.get_editor_property("Parent")
     if parent:
-        template["Parent"] = parent.get_path_name()
+        template["ParentMaterial"] = parent.get_path_name()
 
     mel = unreal.MaterialEditingLibrary
     try:
