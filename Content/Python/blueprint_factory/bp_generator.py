@@ -23,6 +23,11 @@ try:
 except ImportError:
     IN_UE = False
 
+try:
+    from .editor_guard import ensure_editor_not_playing_for_existing_asset
+except ImportError:
+    from editor_guard import ensure_editor_not_playing_for_existing_asset
+
 
 def _log(msg):
     if IN_UE:
@@ -85,6 +90,9 @@ def generate_blueprint(json_path: str):
 
     # 检查蓝图是否已存在，存在则更新
     asset_path = output_path + name
+    if not ensure_editor_not_playing_for_existing_asset(asset_path):
+        return False
+
     bp = unreal.load_asset(asset_path)
     if bp and isinstance(bp, unreal.Blueprint):
         if recreate_existing_asset and not preserve_existing_components:
@@ -251,6 +259,9 @@ def generate_blueprint(json_path: str):
                                 if not assigned:
                                     bp_cdo.set_editor_property(prop_name, prop_value)
                                     _log(f"  CDO 属性: {prop_name} = {prop_value}")
+                            elif isinstance(prop_value, bool):
+                                bp_cdo.set_editor_property(prop_name, prop_value)
+                                _log(f"  CDO bool property {prop_name} = {prop_value}")
                             elif isinstance(prop_value, (int, float)):
                                 bp_cdo.set_editor_property(prop_name, float(prop_value))
                                 _log(f"  CDO 属性: {prop_name} = {prop_value}")
@@ -1006,7 +1017,9 @@ def _set_component_properties(comp_obj, comp_type, comp_data):
 
     if comp_data.get("Rotation"):
         rot = comp_data["Rotation"]
-        comp_obj.set_editor_property("RelativeRotation", unreal.Rotator(rot[0], rot[1], rot[2]))
+        # Blueprint template rotations are exported as [Pitch, Yaw, Roll].
+        # UE Python's Rotator positional constructor is [Roll, Pitch, Yaw].
+        comp_obj.set_editor_property("RelativeRotation", unreal.Rotator(rot[2], rot[0], rot[1]))
 
     if comp_data.get("Scale"):
         sc = comp_data["Scale"]
@@ -1151,29 +1164,32 @@ def export_blueprint(asset_path: str, json_path: str):
     # 父类
     parent_path = str(template.get("ParentClass", "") or "")
     parent_obj = None
+    generated_class = None
     try:
-        parent_obj = bp.get_editor_property("ParentClass")
+        generated_class = bp.generated_class()
     except Exception:
-        parent_obj = None
-
-    if parent_obj is None:
-        generated_class = None
         try:
-            generated_class = bp.generated_class()
+            generated_class = bp.generated_class
+        except Exception:
+            generated_class = None
+
+    if generated_class is not None:
+        try:
+            parent_obj = generated_class.get_super_class()
         except Exception:
             try:
-                generated_class = bp.generated_class
+                parent_obj = generated_class.get_super_struct()
             except Exception:
-                generated_class = None
+                parent_obj = None
 
-        if generated_class is not None:
+    if parent_obj is None:
+        for prop_name in ("ParentClass", "parent_class"):
             try:
-                parent_obj = generated_class.get_super_class()
+                parent_obj = bp.get_editor_property(prop_name)
             except Exception:
-                try:
-                    parent_obj = generated_class.get_super_struct()
-                except Exception:
-                    parent_obj = None
+                parent_obj = None
+            if parent_obj is not None:
+                break
 
     if parent_obj:
         try:

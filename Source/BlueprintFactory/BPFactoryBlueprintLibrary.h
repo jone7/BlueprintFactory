@@ -50,9 +50,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
 	static bool IsUnLuaAvailable();
 
+	/** Stop PIE before overwriting an existing generated asset. */
+	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory|Editor")
+	static bool EnsureEditorNotPlayingForExistingAsset(const FString& AssetPath);
+
 	/** 为 Blueprint 自动挂载 UnLuaInterface 并设置 GetModuleName */
 	UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
-static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
+	static bool SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName);
 UFUNCTION(BlueprintCallable, Category = "BlueprintFactory")
 static bool ResetBlueprintForRegeneration(
 	UBlueprint* Blueprint,

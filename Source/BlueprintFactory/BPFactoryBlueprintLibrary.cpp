@@ -22,6 +22,10 @@
 #include "LandscapeInfo.h"
 #include "Engine/World.h"
 #include "Editor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -36,6 +40,7 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
+#include "UObject/UObjectGlobals.h"
 #include "UObject/UnrealType.h"
 #include "Dom/JsonObject.h"
 #include "Misc/PackageName.h"
@@ -127,6 +132,81 @@ namespace
 
 		const FString AssetName = FPackageName::GetLongPackageAssetName(AssetPath);
 		return AssetName.IsEmpty() ? AssetPath : FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName);
+	}
+
+	FString ToLongPackageNameForGuard(const FString& AssetPath)
+	{
+		FString PackageName = AssetPath;
+		PackageName.TrimStartAndEndInline();
+
+		FString Left;
+		FString Right;
+		if (PackageName.Split(TEXT("."), &Left, &Right, ESearchCase::CaseSensitive, ESearchDir::FromEnd)
+			&& Left.StartsWith(TEXT("/Game/")))
+		{
+			PackageName = Left;
+		}
+
+		return PackageName;
+	}
+
+	bool DoesPackageFileExistForGuard(const FString& AssetPath)
+	{
+		const FString PackageName = ToLongPackageNameForGuard(AssetPath);
+		if (PackageName.IsEmpty() || !FPackageName::IsValidLongPackageName(PackageName))
+		{
+			return false;
+		}
+
+		IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+		const FString AssetFile = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
+		if (PlatformFile.FileExists(*AssetFile))
+		{
+			return true;
+		}
+
+		const FString MapFile = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetMapPackageExtension());
+		return PlatformFile.FileExists(*MapFile);
+	}
+
+	bool EndPlaySessionIfActiveForGuard(const FString& AssetPath)
+	{
+		if (!GEditor || GEditor->PlayWorld == nullptr)
+		{
+			return true;
+		}
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("[BPFactory] PIE is active while overwriting an existing generated asset. Stopping PIE first: %s"),
+			*AssetPath);
+
+		GEditor->RequestEndPlayMap();
+
+		const double DeadlineSeconds = FPlatformTime::Seconds() + 5.0;
+		while (GEditor->PlayWorld != nullptr && FPlatformTime::Seconds() < DeadlineSeconds)
+		{
+			if (FSlateApplication::IsInitialized())
+			{
+				FSlateApplication::Get().Tick(ESlateTickType::Time);
+			}
+			FPlatformProcess::Sleep(0.05f);
+		}
+
+		if (GEditor->PlayWorld != nullptr)
+		{
+			GEditor->EndPlayMap();
+		}
+
+		FlushAsyncLoading();
+		if (GEditor->PlayWorld != nullptr)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("[BPFactory] PIE is still active; aborting overwrite to avoid editor crash: %s"),
+				*AssetPath);
+			return false;
+		}
+
+		return true;
 	}
 
 	template <typename TObjectType>
@@ -2664,6 +2744,16 @@ bool UBPFactoryBlueprintLibrary::IsUnLuaAvailable()
 #else
 	return false;
 #endif
+}
+
+bool UBPFactoryBlueprintLibrary::EnsureEditorNotPlayingForExistingAsset(const FString& AssetPath)
+{
+	if (!DoesPackageFileExistForGuard(AssetPath))
+	{
+		return true;
+	}
+
+	return EndPlaySessionIfActiveForGuard(AssetPath);
 }
 
 bool UBPFactoryBlueprintLibrary::SetupUnLuaBinding(UBlueprint* Blueprint, const FString& ModuleName)

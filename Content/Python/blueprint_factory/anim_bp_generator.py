@@ -8,6 +8,11 @@ try:
 except ImportError:
     IN_UE = False
 
+try:
+    from .editor_guard import ensure_editor_not_playing_for_existing_asset
+except ImportError:
+    from editor_guard import ensure_editor_not_playing_for_existing_asset
+
 
 def _log(msg):
     if IN_UE:
@@ -374,6 +379,9 @@ def generate_anim_blueprint(json_path: str):
             _log(f"Preview mesh not found, continuing without it: {preview_mesh_path}")
 
     asset_path = output_path + name
+    if not ensure_editor_not_playing_for_existing_asset(asset_path):
+        return False
+
     existing = unreal.load_asset(asset_path)
     if existing:
         if not isinstance(existing, unreal.AnimBlueprint):

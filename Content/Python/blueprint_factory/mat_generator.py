@@ -38,6 +38,11 @@ try:
 except ImportError:
     IN_UE = False
 
+try:
+    from .editor_guard import ensure_editor_not_playing_for_existing_asset
+except ImportError:
+    from editor_guard import ensure_editor_not_playing_for_existing_asset
+
 
 def _log(msg):
     if IN_UE:
@@ -121,6 +126,9 @@ def _generate_master_material(template):
     _log(f"生成母材质: {name}")
 
     asset_path = output_path + name
+    if not ensure_editor_not_playing_for_existing_asset(asset_path):
+        return False
+
     mel = unreal.MaterialEditingLibrary
 
     # 检查材质是否已存在，存在则更新而不是重建（保留引用）
@@ -587,6 +595,9 @@ def _generate_material_instance(template):
     asset_path = output_path + name
 
     # 检查是否已存在，存在则更新
+    if not ensure_editor_not_playing_for_existing_asset(asset_path):
+        return False
+
     mi = unreal.load_asset(asset_path)
     if mi and isinstance(mi, unreal.MaterialInstanceConstant):
         _log(f"  材质实例已存在，更新模式: {asset_path}")

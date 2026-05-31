@@ -30,6 +30,11 @@ try:
 except ImportError:
     IN_UE = False
 
+try:
+    from .editor_guard import ensure_editor_not_playing_for_existing_asset
+except ImportError:
+    from editor_guard import ensure_editor_not_playing_for_existing_asset
+
 
 def _log(msg):
     if IN_UE:
@@ -83,6 +88,9 @@ def generate_level(json_path: str):
 
     # 1. 创建新关卡
     asset_path = output_path + level_name
+    if not ensure_editor_not_playing_for_existing_asset(asset_path):
+        return False
+
     level_created = _create_level(asset_path)
     if not level_created:
         _log(f"使用当前已打开的关卡")
