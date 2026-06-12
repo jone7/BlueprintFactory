@@ -10,4 +10,6 @@ public:
 private:
 	void RegisterMenus();
 	TSharedRef<SDockTab> SpawnTab(const FSpawnTabArgs& Args);
+
+	FDelegateHandle PackageSavedHandle;
 };
