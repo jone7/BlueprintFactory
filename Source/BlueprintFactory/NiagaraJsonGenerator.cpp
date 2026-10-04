@@ -12,6 +12,7 @@
 #include "NiagaraNodeAssignment.h"
 #include "ViewModels/Stack/NiagaraParameterHandle.h"
 #include "NiagaraSystemFactoryNew.h"
+#include "NiagaraEditorUtilities.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 #include "EdGraphSchema_Niagara.h"
 #include "Dom/JsonObject.h"
@@ -19,6 +20,8 @@
 #include "Serialization/JsonSerializer.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Misc/PackageName.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Engine/StaticMesh.h"
@@ -112,7 +115,7 @@ public:
 	}
 };
 
-// 外部作者 JSON 在唯一入口严格校验，错误参数不进入原生模块构建。
+// 外部作者 JSON 在唯一入口校验类型、有限数值和完整轨迹；效果大小、密度和裁剪预算由配置决定。
 bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FString& OutError)
 {
 	OutError.Reset();
@@ -152,15 +155,15 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 		FString Path;
 		if (!Mesh->TryGetString(Path) || !Path.StartsWith(TEXT("/Game/"))) { OutError = TEXT("Invalid mesh asset path."); return false; }
 	}
-	const TMap<FString, FVector2D> Ranges = {{TEXT("SpawnRate"), {0, 12}}, {TEXT("FallSpeed"), {1, 200}},
-		{TEXT("SwayStrength"), {0, 100}}, {TEXT("RotationRate"), {0, 6.3}}, {TEXT("CullDistanceCm"), {100, 10000}},
-		{TEXT("MaxInstances"), {1, 64}}};
-	for (const auto& Range : Ranges)
+	// 作者 JSON 决定效果参数；这里仅校验符号与运行时数值表示，不写入某棵树的调优上限。
+	for (const TCHAR* Key : {TEXT("SpawnRate"), TEXT("FallSpeed"), TEXT("SwayStrength"), TEXT("RotationRate"), TEXT("CullDistanceCm"), TEXT("MaxInstances")})
 	{
 		double Value = 0;
-		if (!Json->TryGetNumberField(Range.Key, Value) || !FMath::IsFinite(Value) || Value < Range.Value.X || Value > Range.Value.Y)
+		if (!Json->TryGetNumberField(Key, Value) || !FMath::IsFinite(Value) || !FMath::IsFinite(float(Value)) || Value < 0
+			|| ((FString(Key) == TEXT("FallSpeed") || FString(Key) == TEXT("CullDistanceCm")) && Value == 0)
+			|| (FString(Key) == TEXT("MaxInstances") && (Value < 1 || Value > MAX_int32)))
 		{
-			OutError = TEXT("Out of range: ") + Range.Key; return false;
+			OutError = FString(TEXT("Invalid numeric value: ")) + Key; return false;
 		}
 	}
 	for (const TCHAR* Key : {TEXT("Lifetime"), TEXT("ScaleRange"), TEXT("SpawnHalfExtent"), TEXT("WindVelocity"), TEXT("FixedBoundsMin"), TEXT("FixedBoundsMax")})
@@ -174,7 +177,7 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 		for (const auto& Entry : *Values)
 		{
 			double Value = 0;
-			if (!Entry->TryGetNumber(Value) || !FMath::IsFinite(Value) || FMath::Abs(Value) > 10000)
+			if (!Entry->TryGetNumber(Value) || !FMath::IsFinite(Value) || !FMath::IsFinite(float(Value)))
 			{
 				OutError = FString(TEXT("Invalid vector value: ")) + Key; return false;
 			}
@@ -182,10 +185,9 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 	}
 	const auto& Lifetime = Json->GetArrayField(TEXT("Lifetime"));
 	const auto& Scale = Json->GetArrayField(TEXT("ScaleRange"));
-	if (Lifetime[0]->AsNumber() < .5 || Lifetime[1]->AsNumber() > 20 || Lifetime[1]->AsNumber() < Lifetime[0]->AsNumber()
-		|| Scale[0]->AsNumber() <= 0 || Scale[1]->AsNumber() > 5 || Scale[1]->AsNumber() < Scale[0]->AsNumber()
-		|| FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent")).GetMin() <= 0
-		|| FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent")).GetMax() > 1000)
+	if (Lifetime[0]->AsNumber() <= 0 || Lifetime[1]->AsNumber() < Lifetime[0]->AsNumber()
+		|| Scale[0]->AsNumber() <= 0 || Scale[1]->AsNumber() < Scale[0]->AsNumber()
+		|| FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent")).GetMin() <= 0)
 	{
 		OutError = TEXT("Invalid lifetime, scale range or spawn half extent."); return false;
 	}
@@ -228,6 +230,8 @@ FString UNiagaraJsonGenerator::DescribeSystem(UNiagaraSystem* System)
 	Json->SetBoolField(TEXT("ready"), System->IsReadyToRun());
 	Json->SetBoolField(TEXT("fixedBounds"), System->bFixedBounds);
 	Json->SetNumberField(TEXT("emitters"), System->GetEmitterHandles().Num());
+	Json->SetNumberField(TEXT("compiledEmitters"), System->GetEmitterCompiledData().Num());
+	Json->SetNumberField(TEXT("spawnInfoCount"), System->GetEmitterHandles().IsEmpty() ? 0 : System->GetEmitterSpawnInfoAccessors(0).Num());
 	int32 MeshCount = 0;
 	bool bWorldSpace = true, bCpu = true, bUserMaterial = true;
 	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
@@ -299,7 +303,9 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	TSet<FGuid> OldHandles;
 	for (const FNiagaraEmitterHandle& Handle : Builder.System->GetEmitterHandles()) OldHandles.Add(Handle.GetId());
 	Builder.System->RemoveEmitterHandlesById(OldHandles);
-	const FNiagaraEmitterHandle Handle = Builder.System->AddEmitterHandle(*Minimal, TEXT("LeafFall"), Minimal->GetExposedVersion().VersionGuid);
+	// 使用编辑器正式入口登记发射器并连接系统执行图，而非仅修改 Handle 数组。
+	FNiagaraEditorUtilities::AddEmitterToSystem(*Builder.System, *Minimal, Minimal->GetExposedVersion().VersionGuid);
+	const FNiagaraEmitterHandle Handle = Builder.System->GetEmitterHandles().Last();
 	Builder.Emitter = Handle.GetInstance().Emitter;
 	auto* Data = Builder.Emitter->GetLatestEmitterData();
 	Data->bLocalSpace = false;
@@ -388,7 +394,18 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	Data->GraphSource->ForceGraphToRecompileOnNextCheck();
 	Builder.System->RequestCompile(true);
 	Builder.System->WaitForCompilationComplete(false, false);
-	if (!Builder.System->IsValid() || !Builder.System->IsReadyToRun())
+	// 显式诊断开关只导出本批编译文本到 Saved，不改变作者配置或引擎模板。
+	if (FParse::Param(FCommandLine::Get(), TEXT("TreeLeafDiagnostics")))
+	{
+		const FString DiagnosticRoot = FPaths::ProjectSavedDir() / TEXT("Profiling/tree_leaf_fall/");
+		FFileHelper::SaveStringToFile(Builder.System->GetSystemSpawnScript()->GetVMExecutableData().LastHlslTranslation, *(DiagnosticRoot + TEXT("SystemSpawn.ush")));
+		FFileHelper::SaveStringToFile(Builder.System->GetSystemUpdateScript()->GetVMExecutableData().LastHlslTranslation, *(DiagnosticRoot + TEXT("SystemUpdate.ush")));
+		UE_LOG(LogTemp, Display, TEXT("Leaf compiled data: %d; spawn attributes: %d; update attributes: %d; reads: %d"),
+			Builder.System->GetEmitterCompiledData().Num(), Data->SpawnScriptProps.Script->GetVMExecutableData().Attributes.Num(),
+			Data->UpdateScriptProps.Script->GetVMExecutableData().Attributes.Num(), Data->SpawnScriptProps.Script->GetVMExecutableData().DataUsage.bReadsAttributeData);
+	}
+	if (!Builder.System->IsValid() || !Builder.System->IsReadyToRun()
+		|| Builder.System->GetEmitterCompiledData().Num() != 1 || Builder.System->GetEmitterSpawnInfoAccessors(0).IsEmpty())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("Niagara JSON compile failed: %s"), *OutputAssetPath); return nullptr;
 	}
