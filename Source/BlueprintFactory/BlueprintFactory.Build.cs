@@ -31,6 +31,10 @@ public class BlueprintFactory : ModuleRules
 			"Kismet",
 			"BlueprintGraph",
 			"AnimGraph",
+			"Niagara",
+			"NiagaraCore",
+			"NiagaraEditor",
+			"AssetRegistry",
 		});
 
 		bool bHasUnLua = false;
