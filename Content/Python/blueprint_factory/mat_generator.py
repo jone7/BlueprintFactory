@@ -1,5 +1,5 @@
 """BlueprintFactory - 材质生成器
-支持两种模式：
+支持材质、材质实例、公共材质函数及参数集合：
 1. Type="Material" — 生成母材质（含节点图）
 2. Type="MaterialInstance" 或无 Type — 生成材质实例
 
@@ -63,7 +63,7 @@ def _log_error(msg):
 # ===================================================================
 
 def generate_material(json_path: str):
-    """从 JSON 模板生成材质（自动判断母材质或材质实例）"""
+    """按 JSON 声明生成材质资源；未知类型直接拒绝，避免误生成实例。"""
     if not os.path.isfile(json_path):
         _log_error(f"JSON 文件不存在: {json_path}")
         return False
@@ -74,9 +74,17 @@ def generate_material(json_path: str):
     mat_type = template.get("Type", "MaterialInstance")
 
     if mat_type == "Material":
+        if "SurfaceExtension" in template:
+            return _generate_material_surface_extension(template)
         return _generate_master_material(template)
-    else:
+    if mat_type == "MaterialFunction":
+        return _generate_material_function(template)
+    if mat_type == "MaterialParameterCollection":
+        return _generate_parameter_collection(template)
+    if mat_type == "MaterialInstance":
         return _generate_material_instance(template)
+    _log_error(f"不支持的材质类型: {mat_type}")
+    return False
 
 
 # ===================================================================
@@ -105,10 +113,153 @@ NODE_TYPE_ALIASES = {
 # 需要特殊构造逻辑的类型（不能纯靠 set_editor_property）
 SPECIAL_NODE_TYPES = {"LandscapeLayerBlend", "TextureSample", "TextureSampleParameter2D",
                       "Constant", "Constant3Vector", "Constant4Vector",
-                      "ScalarParameter", "VectorParameter", "Custom"}
+                      "ScalarParameter", "VectorParameter", "Custom",
+                      "MaterialFunctionCall", "CollectionParameter", "FunctionInput", "FunctionOutput",
+                      "StaticSwitchParameter"}
 
 # set_editor_property 时跳过的保留字段
-_RESERVED_FIELDS = {"Type", "Name", "Texture", "Layers", "Value"}
+_RESERVED_FIELDS = {"Type", "Name", "Texture", "Layers", "Value", "Position"}
+
+def _validate_graph(template):
+    """在清理已有图之前校验节点、连线和外部资源，缺失依赖直接失败。"""
+    names = set()
+    for node in template["Nodes"]:
+        name = node["Name"]
+        if not name or "." in name or name in names or name == "Material":
+            raise ValueError(f"节点名无效或重复: {name}")
+        names.add(name)
+        node_type = NODE_TYPE_ALIASES.get(node["Type"], node["Type"])
+        if not getattr(unreal, "MaterialExpression" + node_type, None):
+            raise ValueError(f"节点类型不存在: {node_type}")
+        if node_type == "MaterialFunctionCall":
+            dependency = unreal.load_asset(node["MaterialFunction"])
+            if not isinstance(dependency, unreal.MaterialFunctionInterface):
+                raise ValueError(f"节点 {name} 的公共函数不存在或类型不符")
+        if node_type == "CollectionParameter":
+            dependency = unreal.load_asset(node["Collection"])
+            if not isinstance(dependency, unreal.MaterialParameterCollection):
+                raise ValueError(f"节点 {name} 的参数集合不存在或类型不符")
+            parameters = list(dependency.get_editor_property("ScalarParameters")) + list(dependency.get_editor_property("VectorParameters"))
+            if node["ParameterName"] not in {str(p.get_editor_property("parameter_name")) for p in parameters}:
+                raise ValueError(f"节点 {name} 引用不存在的集合参数")
+    for connection in template["Connections"]:
+        source = connection["From"].split(".", 1)[0]
+        target = connection["To"].split(".", 1)[0]
+        if source not in names or (target not in names and target != "Material"):
+            raise ValueError(f"连线引用不存在的节点: {connection}")
+
+
+def _generate_material_function(template):
+    """原位生成公共函数，保留函数资源身份及同名接口的 GUID。"""
+    if not IN_UE:
+        return False
+    _validate_graph(template)
+    name, folder = template["Name"], template["OutputPath"].rstrip("/")
+    path = folder + "/" + name
+    if not ensure_editor_not_playing_for_existing_asset(path):
+        return False
+    function = unreal.load_asset(path)
+    ports = {}
+    wanted_ports = {(data["Type"], data["Name"]) for data in template["Nodes"]
+                    if data["Type"] in ("FunctionInput", "FunctionOutput")}
+    if function:
+        if not isinstance(function, unreal.MaterialFunction):
+            raise TypeError(f"目标不是材质函数: {path}")
+        for expression in unreal.MaterialEditingLibrary.get_material_function_expressions(function):
+            key = None
+            if isinstance(expression, unreal.MaterialExpressionFunctionInput):
+                key = ("FunctionInput", str(expression.get_editor_property("InputName")))
+            elif isinstance(expression, unreal.MaterialExpressionFunctionOutput):
+                key = ("FunctionOutput", str(expression.get_editor_property("OutputName")))
+            if key in wanted_ports:
+                if key in ports:
+                    raise ValueError(f"函数接口重复: {key}")
+                # 接口 GUID 是受保护字段，保留节点对象即可保留 GUID；旧连线按配置重建。
+                ports[key] = expression
+                for pin in unreal.MaterialEditingLibrary.get_material_expression_input_names(expression):
+                    unreal.MaterialEditingLibrary.disconnect_material_expressions(expression, pin)
+            else:
+                unreal.MaterialEditingLibrary.delete_material_expression_in_function(function, expression)
+    else:
+        function = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+            name, folder, unreal.MaterialFunction, unreal.MaterialFunctionFactoryNew())
+    if not function:
+        raise RuntimeError(f"创建材质函数失败: {path}")
+    function.set_editor_property("Description", template.get("Description", ""))
+    nodes = {}
+    for index, data in enumerate(template["Nodes"]):
+        key = (data["Type"], data["Name"])
+        expression = _create_node(function, data, index, ports.get(key))
+        nodes[data["Name"]] = expression
+    for connection in template["Connections"]:
+        _connect_nodes(function, unreal.MaterialEditingLibrary, nodes, connection)
+    unreal.MaterialEditingLibrary.update_material_function(function)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(function):
+        raise RuntimeError(f"材质函数保存失败: {path}")
+    _log(f"材质函数生成完成: {path}")
+    return True
+
+
+def _generate_parameter_collection(template):
+    """原位更新集合默认值，保留同名参数 GUID，防止已有材质引用失效。"""
+    if not IN_UE:
+        return False
+    name, folder = template["Name"], template["OutputPath"].rstrip("/")
+    path = folder + "/" + name
+    if not ensure_editor_not_playing_for_existing_asset(path):
+        return False
+    collection = unreal.load_asset(path)
+    if collection and not isinstance(collection, unreal.MaterialParameterCollection):
+        raise TypeError(f"目标不是参数集合: {path}")
+    if not collection:
+        collection = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+            name, folder, unreal.MaterialParameterCollection, unreal.MaterialParameterCollectionFactoryNew())
+    if not collection:
+        raise RuntimeError(f"创建参数集合失败: {path}")
+    names = set()
+    for field, struct_type in (("ScalarParameters", unreal.CollectionScalarParameter),
+                               ("VectorParameters", unreal.CollectionVectorParameter)):
+        previous = {str(parameter.get_editor_property("parameter_name")): parameter for parameter in collection.get_editor_property(field)}
+        parameters = []
+        for data in template.get(field, []):
+            parameter_name = data["Name"]
+            if parameter_name in names:
+                raise ValueError(f"集合参数重复: {parameter_name}")
+            names.add(parameter_name)
+            parameter = previous.get(parameter_name)
+            if parameter is None:
+                parameter = struct_type()
+            parameter.set_editor_property("parameter_name", parameter_name)
+            value = data["Value"]
+            parameter.set_editor_property("default_value", float(value) if field == "ScalarParameters"
+                                          else unreal.LinearColor(*value))
+            parameters.append(parameter)
+        collection.set_editor_property(field, parameters)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(collection):
+        raise RuntimeError(f"参数集合保存失败: {path}")
+    _log(f"参数集合生成完成: {path}")
+    return True
+
+
+def _generate_material_surface_extension(template):
+    """从正式配置扩展现有游戏材质，保留原图、资源身份和材质实例引用。"""
+    path = template["OutputPath"].rstrip("/") + "/" + template["Name"]
+    if not IN_UE or not ensure_editor_not_playing_for_existing_asset(path):
+        return False
+    material = unreal.load_asset(path)
+    if not isinstance(material, unreal.Material):
+        raise TypeError(f"被扩展的原材质不存在: {path}")
+    extension = template["SurfaceExtension"]
+    function = unreal.load_asset(extension["SnowFunction"])
+    collection = unreal.load_asset(extension["Collection"])
+    if not isinstance(function, unreal.MaterialFunctionInterface) or not isinstance(collection, unreal.MaterialParameterCollection):
+        raise TypeError(f"公共覆盖依赖缺失: {path}")
+    if not unreal.SurfaceMaterialAuthoringLibrary.apply_snow_cover(material, function, collection, extension["EnableSnowCover"]):
+        raise RuntimeError(f"原位接入积雪失败: {path}")
+    if not unreal.EditorAssetLibrary.save_loaded_asset(material):
+        raise RuntimeError(f"扩展材质保存失败: {path}")
+    _log(f"正式游戏材质扩展完成: {path}")
+    return True
 
 
 def _generate_master_material(template):
@@ -125,6 +276,8 @@ def _generate_master_material(template):
 
     _log(f"生成母材质: {name}")
 
+    _validate_graph(template)
+    output_path = output_path.rstrip("/") + "/"
     asset_path = output_path + name
     if not ensure_editor_not_playing_for_existing_asset(asset_path):
         return False
@@ -133,10 +286,13 @@ def _generate_master_material(template):
 
     # 检查材质是否已存在，存在则更新而不是重建（保留引用）
     mat = unreal.load_asset(asset_path)
-    if mat and isinstance(mat, unreal.Material):
-        _log(f"  材质已存在，删除后重建: {asset_path}")
-        unreal.EditorAssetLibrary.delete_asset(asset_path)
-        mat = None
+    if mat:
+        if not isinstance(mat, unreal.Material):
+            raise TypeError(f"目标不是母材质: {asset_path}")
+        _log(f"  原位更新母材质，保留实例引用: {asset_path}")
+        # 引擎批量删除会边遍历边移除表达式，使用节点快照逐个删除避免残留旧图。
+        for expression in list(mel.get_material_expressions(mat)):
+            mel.delete_material_expression(mat, expression)
 
     if not mat:
         asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -148,13 +304,6 @@ def _generate_master_material(template):
 
     # 设置材质属性
     _apply_material_properties(mat, properties)
-
-    # 清除所有材质输出引脚的连线（防止旧连线残留）
-    for prop_name, prop_enum in MATERIAL_OUTPUTS.items():
-        try:
-            mel.clear_material_property(mat, _get_material_property(prop_name))
-        except Exception:
-            pass
 
     # 创建节点
     node_map = {}  # name → expression
@@ -183,7 +332,8 @@ def _generate_master_material(template):
         # UE 5.7: post_edit_change 不再暴露给 Python，recompile_material 已足够
         pass
     asset_path = output_path + name
-    unreal.EditorAssetLibrary.save_asset(asset_path)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(mat):
+        raise RuntimeError(f"母材质保存失败: {asset_path}")
 
     _log(f"母材质生成完成: {asset_path} ({len(nodes)} 个节点, {len(connections)} 条连线)")
     return True
@@ -252,7 +402,7 @@ def _apply_material_properties(mat, properties):
                 _log(f"  警告: 设置 {key} 失败: {e}")
 
 
-def _create_node(mat, node_data, index=0):
+def _create_node(mat, node_data, index=0, expression=None):
     """创建材质节点（动态反射模式）"""
     node_type = node_data.get("Type", "")
     node_name = node_data.get("Name", "")
@@ -302,10 +452,18 @@ def _create_node(mat, node_data, index=0):
         _log(f"  找不到节点类: {ue_class_name}，跳过 {node_name}")
         return None
 
-    expr = mel.create_material_expression(mat, expr_class, pos_x, pos_y)
+    # 同名函数接口复用原节点以保留受保护的 GUID，其余节点通过同一配置路径创建。
+    expr = expression
+    if expr is None:
+        expr = (mel.create_material_expression_in_function(mat, expr_class, pos_x, pos_y)
+                if isinstance(mat, unreal.MaterialFunction)
+                else mel.create_material_expression(mat, expr_class, pos_x, pos_y))
+    else:
+        expr.set_editor_property("MaterialExpressionEditorX", pos_x)
+        expr.set_editor_property("MaterialExpressionEditorY", pos_y)
     if not expr:
-        _log(f"  创建节点失败: {node_name} ({node_type})")
-        return None
+        raise RuntimeError(f"创建节点失败: {node_name} ({node_type})")
+    expr.set_editor_property("Desc", "CookerJsonNode:" + node_name)
 
     # === 特殊类型处理（需要非标准属性设置） ===
     if node_type in ("TextureSample", "TextureSampleParameter2D"):
@@ -344,6 +502,40 @@ def _create_node(mat, node_data, index=0):
         expr.set_editor_property("ParameterName", node_name)
         val = node_data.get("Value", [0, 0, 0, 1])
         expr.set_editor_property("DefaultValue", unreal.LinearColor(val[0], val[1], val[2], val[3] if len(val) > 3 else 1.0))
+
+    elif node_type == "MaterialFunctionCall":
+        function = unreal.load_asset(node_data["MaterialFunction"])
+        if not expr.set_material_function(function):
+            raise RuntimeError(f"函数绑定失败: {node_name}")
+
+    elif node_type == "CollectionParameter":
+        collection = unreal.load_asset(node_data["Collection"])
+        parameter_name = node_data["ParameterName"]
+        parameters = list(collection.get_editor_property("ScalarParameters")) + list(collection.get_editor_property("VectorParameters"))
+        if parameter_name not in {str(parameter.get_editor_property("parameter_name")) for parameter in parameters}:
+            raise ValueError(f"集合参数不存在: {node_name}.{parameter_name}")
+        expr.set_editor_property("Collection", collection)
+        expr.set_editor_property("ParameterName", parameter_name)
+
+    elif node_type == "FunctionInput":
+        expr.set_editor_property("InputName", node_name)
+        expr.set_editor_property("InputType", getattr(unreal.FunctionInputType, "FUNCTION_INPUT_" + node_data["InputType"].upper()))
+        expr.set_editor_property("SortPriority", node_data.get("SortPriority", index))
+        expr.set_editor_property("bUsePreviewValueAsDefault", "PreviewValue" in node_data)
+        if "PreviewValue" in node_data:
+            # UE 5.8 的 float4 反射结构只提供无参构造，按声明逐分量填写预览值。
+            preview = unreal.Vector4f()
+            for component, value in zip(("X", "Y", "Z", "W"), node_data["PreviewValue"]):
+                preview.set_editor_property(component, float(value))
+            expr.set_editor_property("PreviewValue", preview)
+
+    elif node_type == "FunctionOutput":
+        expr.set_editor_property("OutputName", node_name)
+        expr.set_editor_property("SortPriority", node_data.get("SortPriority", index))
+
+    elif node_type == "StaticSwitchParameter":
+        expr.set_editor_property("ParameterName", node_data.get("ParameterName", node_name))
+        expr.set_editor_property("DefaultValue", node_data["Value"])
 
     elif node_type == "Custom":
         code = node_data.get("Code", "return 0;")
@@ -430,12 +622,12 @@ def _create_node(mat, node_data, index=0):
 
 
 def _connect_nodes(mat, mel, node_map, conn):
-    """连接两个节点"""
+    """按声明的引脚连接；拒绝失败和隐式改接，防止不完整材质被保存。"""
     from_str = conn.get("From", "")
     to_str = conn.get("To", "")
 
     if not from_str or not to_str:
-        return
+        raise ValueError(f"连线缺少端点: {conn}")
 
     # 解析 "NodeName.OutputPin" 格式
     from_parts = from_str.split(".")
@@ -447,96 +639,22 @@ def _connect_nodes(mat, mel, node_map, conn):
     to_node_name = to_parts[0]
     to_pin = to_parts[1] if len(to_parts) > 1 else ""
 
-    # 连接到材质输出
+    from_expr = node_map[from_node_name]
+    # 函数图只能通过 FunctionOutput 返回结果，不能连接材质表面输出。
     if to_node_name == "Material":
-        from_expr = node_map.get(from_node_name)
-        if not from_expr:
-            _log(f"  连线失败: 找不到源节点 {from_node_name}")
-            return
-
+        if isinstance(mat, unreal.MaterialFunction):
+            raise ValueError("函数图不能连接 Material 输出")
         mat_prop = _get_material_property(to_pin)
-        _log(f"  连线材质输出: {from_node_name}({from_expr.get_class().get_name()}) → Material.{to_pin} (prop={mat_prop})")
-
-        try:
-            # connect_material_property(from_expression, output_name, property)
-            # output_name 对于单输出节点用空字符串
-            result = mel.connect_material_property(from_expr, from_pin if from_pin else "", mat_prop)
-            if result:
-                _log(f"  连线成功: {from_str} → Material.{to_pin}")
-            else:
-                _log(f"  连线返回 False: {from_str} → Material.{to_pin} (prop={mat_prop})")
-        except Exception as e:
-            _log(f"  连线异常: {from_str} → Material.{to_pin}: {e}")
-            # 尝试不带 output_name
-            try:
-                result = mel.connect_material_property(from_expr, "", mat_prop)
-                if result:
-                    _log(f"  连线成功(空pin): {from_str} → Material.{to_pin}")
-            except Exception as e2:
-                _log(f"  连线再次失败: {e2}")
-        return
-
-    # 节点之间连接
-    from_expr = node_map.get(from_node_name)
-    to_expr = node_map.get(to_node_name)
-    if not from_expr or not to_expr:
-        _log(f"  连线失败: 找不到节点 {from_node_name} 或 {to_node_name}")
-        return
-
-    # LandscapeLayerBlend input pins: try multiple name formats
-    actual_to_pin = to_pin
-    is_layer_blend = False
-    if to_expr and hasattr(to_expr, 'get_class'):
-        class_name = str(to_expr.get_class().get_name())
-        if 'LandscapeLayerBlend' in class_name:
-            is_layer_blend = True
-
-    if is_layer_blend and to_pin:
-        # Debug: list all input pins
-        try:
-            inputs = to_expr.get_editor_property("Layers")
-            _log(f"  LayerBlend 层数: {len(inputs)}")
-            for i, layer in enumerate(inputs):
-                ln = layer.get_editor_property("layer_name")
-                _log(f"  LayerBlend 层[{i}]: {ln}")
-        except Exception as dbg_e:
-            _log(f"  LayerBlend 调试失败: {dbg_e}")
-
-        actual_from_pin = from_pin if from_pin else ""
-        pin_formats = [
-            f"Layer {to_pin}",
-            to_pin,
-            f"Layer_{to_pin}",
-            f"Layer {to_pin} ",
-        ]
-        connected = False
-        for pin_name in pin_formats:
-            try:
-                result = mel.connect_material_expressions(from_expr, actual_from_pin, to_expr, pin_name)
-                if result:
-                    _log(f"  连线成功(真): {from_str} → {to_node_name}.{pin_name}")
-                    connected = True
-                    break
-                else:
-                    _log(f"  连线返回False: {from_str} → {to_node_name}.{pin_name}")
-            except Exception as ce:
-                _log(f"  连线异常: {pin_name}: {ce}")
-                continue
-        if not connected:
-            _log(f"  连线全部失败: {from_str} → {to_node_name}.{to_pin}")
-        return
-
-    output_index = _get_output_index(from_pin)
-    input_index = _get_input_index(actual_to_pin)
-
-    try:
+        result = mel.connect_material_property(from_expr, from_pin, mat_prop)
+    else:
+        to_expr = node_map[to_node_name]
+        actual_to_pin = to_pin
+        if isinstance(to_expr, unreal.MaterialExpressionLandscapeLayerBlend) and to_pin:
+            actual_to_pin = "Layer " + to_pin
         result = mel.connect_material_expressions(from_expr, from_pin, to_expr, actual_to_pin)
-        if result:
-            _log(f"  连线OK: {from_str} → {to_node_name}.{actual_to_pin}")
-        else:
-            _log(f"  连线返回False: {from_str} → {to_node_name}.{actual_to_pin}")
-    except Exception as e:
-        _log(f"  连线失败: {from_str} → {to_node_name}.{actual_to_pin}: {e}")
+    if not result:
+        raise RuntimeError(f"材质连线失败: {from_str} → {to_str}")
+    _log(f"  连线OK: {from_str} → {to_str}")
 
 
 def _get_output_index(pin_name):
@@ -566,7 +684,7 @@ def _get_material_property(pin_name):
         "WorldPositionOffset": unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET,
         "Refraction": unreal.MaterialProperty.MP_REFRACTION,
     }
-    return prop_map.get(pin_name, unreal.MaterialProperty.MP_BASE_COLOR)
+    return prop_map[pin_name]
 
 
 # ===================================================================
@@ -574,10 +692,10 @@ def _get_material_property(pin_name):
 # ===================================================================
 
 def _generate_material_instance(template):
-    """生成材质实例"""
+    """生成或原位更新材质实例，目录是否带末尾斜杠不改变资源身份。"""
     name = template.get("Name", "MI_Generated")
     parent_path = template.get("ParentMaterial", template.get("Parent", "/Engine/EngineMaterials/DefaultMaterial"))
-    output_path = template.get("OutputPath", "/Game/Art/Materials/Generated/")
+    output_path = template.get("OutputPath", "/Game/Art/Materials/Generated/").rstrip("/")
     textures = template.get("Textures", {})
     parameters = template.get("Parameters", {})
 
@@ -592,7 +710,7 @@ def _generate_material_instance(template):
         _log_error(f"无法加载父材质: {parent_path}")
         return False
 
-    asset_path = output_path + name
+    asset_path = output_path + "/" + name
 
     # 检查是否已存在，存在则更新
     if not ensure_editor_not_playing_for_existing_asset(asset_path):
@@ -627,8 +745,18 @@ def _generate_material_instance(template):
             mel.set_material_instance_vector_parameter_value(mi, param_name, color)
             _log(f"  向量参数: {param_name} = {value}")
 
-    asset_path = output_path + name
-    unreal.EditorAssetLibrary.save_asset(asset_path)
+    for param_name, value in template.get("StaticSwitchParameters", {}).items():
+        if not isinstance(value, bool):
+            raise TypeError(f"静态开关必须是布尔值: {param_name}")
+        if param_name not in {str(n) for n in mel.get_static_switch_parameter_names(mi)}:
+            raise RuntimeError(f"静态开关不存在: {param_name}")
+        # UE 5.8 此 setter 成功后也固定返回 false，必须回读实际参数值验收。
+        mel.set_material_instance_static_switch_parameter_value(mi, param_name, value)
+        if mel.get_material_instance_static_switch_parameter_value(mi, param_name) != value:
+            raise RuntimeError(f"静态开关回读不一致: {param_name}")
+    mel.update_material_instance(mi)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(mi):
+        raise RuntimeError(f"材质实例保存失败: {asset_path}")
     _log(f"材质实例生成完成: {asset_path}")
     return True
 
@@ -673,21 +801,19 @@ def _export_material_instance(mi, asset_path, json_path):
         template["ParentMaterial"] = parent.get_path_name()
 
     mel = unreal.MaterialEditingLibrary
-    try:
-        tex_params = mel.get_texture_parameter_names(mi)
-        for p in tex_params:
-            tex = mel.get_material_instance_texture_parameter_value(mi, p)
-            if tex:
-                template["Textures"][str(p)] = tex.get_path_name()
-    except Exception:
-        pass
-
-    try:
-        scalar_params = mel.get_scalar_parameter_names(mi)
-        for p in scalar_params:
-            template["Parameters"][str(p)] = round(mel.get_material_instance_scalar_parameter_value(mi, p), 4)
-    except Exception:
-        pass
+    for parameter in mel.get_texture_parameter_names(mi):
+        texture = mel.get_material_instance_texture_parameter_value(mi, parameter)
+        if texture:
+            template["Textures"][str(parameter)] = texture.get_path_name()
+    for parameter in mel.get_scalar_parameter_names(mi):
+        template["Parameters"][str(parameter)] = mel.get_material_instance_scalar_parameter_value(mi, parameter)
+    for parameter in mel.get_vector_parameter_names(mi):
+        color = mel.get_material_instance_vector_parameter_value(mi, parameter)
+        template["Parameters"][str(parameter)] = [color.r, color.g, color.b, color.a]
+    template["StaticSwitchParameters"] = {
+        str(parameter): mel.get_material_instance_static_switch_parameter_value(mi, parameter)
+        for parameter in mel.get_static_switch_parameter_names(mi)
+    }
 
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     with open(json_path, "w", encoding="utf-8") as f:
@@ -701,6 +827,13 @@ def _export_master_material(mat, asset_path, json_path):
     """导出母材质（节点图）"""
     mel = unreal.MaterialEditingLibrary
     expressions = mel.get_material_expressions(mat)
+
+    # 旧导出器不能完整表达函数调用及集合连线，禁止覆盖公共层的正式源模板。
+    # 本轮只增加生成和独立资源回读；完整图反向编辑需另行实现。
+    if any(isinstance(expr, (unreal.MaterialExpressionMaterialFunctionCall,
+                             unreal.MaterialExpressionCollectionParameter)) for expr in expressions):
+        _log("公共函数材质的完整反向导出尚未支持；保留正式 JSON: " + json_path)
+        return False
 
     template = {
         "Name": mat.get_name(),
