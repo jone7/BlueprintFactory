@@ -4,6 +4,7 @@
 #include "NiagaraScript.h"
 #include "NiagaraEffectType.h"
 #include "NiagaraMeshRendererProperties.h"
+#include "NiagaraSpriteRendererProperties.h"
 #include "NiagaraGraph.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraNodeInput.h"
@@ -127,14 +128,19 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 	double Version = 0;
 	FString Preset;
 	if (!Json->TryGetNumberField(TEXT("SchemaVersion"), Version) || Version != 1
-		|| !Json->TryGetStringField(TEXT("Preset"), Preset) || Preset != TEXT("LeafFall"))
+		|| !Json->TryGetStringField(TEXT("Preset"), Preset)
+        || (Preset != TEXT("LeafFall") && Preset != TEXT("SmokeSprite")))
 	{
-		OutError = TEXT("Only SchemaVersion=1, Preset=LeafFall is supported."); return false;
+		OutError = TEXT("Only SchemaVersion=1, Preset=LeafFall or SmokeSprite is supported."); return false;
 	}
-	const TSet<FString> Allowed = {TEXT("SchemaVersion"), TEXT("Preset"), TEXT("Name"), TEXT("Meshes"),
-		TEXT("DefaultMaterial"), TEXT("EffectTypePath"), TEXT("SpawnRate"), TEXT("Lifetime"), TEXT("ScaleRange"),
-		TEXT("SpawnHalfExtent"), TEXT("WindVelocity"), TEXT("FallSpeed"), TEXT("SwayStrength"), TEXT("RotationRate"),
-		TEXT("CullDistanceCm"), TEXT("MaxInstances"), TEXT("FixedBoundsMin"), TEXT("FixedBoundsMax")};
+    const bool bSmoke = Preset == TEXT("SmokeSprite");
+    TSet<FString> Allowed = {TEXT("SchemaVersion"), TEXT("Preset"), TEXT("Name"),
+        TEXT("DefaultMaterial"), TEXT("EffectTypePath"), TEXT("SpawnRate"), TEXT("Lifetime"),
+        TEXT("SpawnHalfExtent"), TEXT("WindVelocity"), TEXT("SwayStrength"), TEXT("RotationRate"),
+        TEXT("CullDistanceCm"), TEXT("MaxInstances"), TEXT("FixedBoundsMin"), TEXT("FixedBoundsMax")};
+    if (bSmoke) Allowed.Append({TEXT("SizeRange"), TEXT("RiseSpeed"), TEXT("Opacity"), TEXT("Color"),
+        TEXT("SubImageSize"), TEXT("FrameRange"), TEXT("FlipbookRate"), TEXT("Seed")});
+    else Allowed.Append({TEXT("Meshes"), TEXT("ScaleRange"), TEXT("FallSpeed")});
 	for (const auto& Field : Json->Values)
 	{
 		const FString Key(Field.Key);
@@ -145,6 +151,8 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 		FString Value;
 		if (!Json->TryGetStringField(Key, Value) || Value.IsEmpty()) { OutError = FString(TEXT("Missing string: ")) + Key; return false; }
 	}
+    if (!bSmoke)
+    {
 	const TArray<TSharedPtr<FJsonValue>>* Meshes = nullptr;
 	if (!Json->TryGetArrayField(TEXT("Meshes"), Meshes) || Meshes->Num() < 1 || Meshes->Num() > 8)
 	{
@@ -155,8 +163,12 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 		FString Path;
 		if (!Mesh->TryGetString(Path) || !Path.StartsWith(TEXT("/Game/"))) { OutError = TEXT("Invalid mesh asset path."); return false; }
 	}
+    }
 	// 作者 JSON 决定效果参数；这里仅校验符号与运行时数值表示，不写入某棵树的调优上限。
-	for (const TCHAR* Key : {TEXT("SpawnRate"), TEXT("FallSpeed"), TEXT("SwayStrength"), TEXT("RotationRate"), TEXT("CullDistanceCm"), TEXT("MaxInstances")})
+	TArray<FString> ScalarKeys = {TEXT("SpawnRate"), TEXT("SwayStrength"), TEXT("RotationRate"), TEXT("CullDistanceCm"), TEXT("MaxInstances")};
+    if (bSmoke) ScalarKeys.Append({TEXT("RiseSpeed"), TEXT("Opacity"), TEXT("FlipbookRate"), TEXT("Seed")});
+    else ScalarKeys.Add(TEXT("FallSpeed"));
+    for (const FString& Key : ScalarKeys)
 	{
 		double Value = 0;
 		if (!Json->TryGetNumberField(Key, Value) || !FMath::IsFinite(Value) || !FMath::IsFinite(float(Value)) || Value < 0
@@ -166,10 +178,15 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 			OutError = FString(TEXT("Invalid numeric value: ")) + Key; return false;
 		}
 	}
-	for (const TCHAR* Key : {TEXT("Lifetime"), TEXT("ScaleRange"), TEXT("SpawnHalfExtent"), TEXT("WindVelocity"), TEXT("FixedBoundsMin"), TEXT("FixedBoundsMax")})
+	TArray<FString> VectorKeys = {TEXT("Lifetime"), TEXT("SpawnHalfExtent"), TEXT("WindVelocity"), TEXT("FixedBoundsMin"), TEXT("FixedBoundsMax")};
+    if (bSmoke) VectorKeys.Append({TEXT("SizeRange"), TEXT("SubImageSize"), TEXT("FrameRange"), TEXT("Color")});
+    else VectorKeys.Add(TEXT("ScaleRange"));
+    for (const FString& Key : VectorKeys)
 	{
 		const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
-		const int32 Expected = FString(Key) == TEXT("Lifetime") || FString(Key) == TEXT("ScaleRange") ? 2 : 3;
+		const int32 Expected = Key == TEXT("Color") ? 4 :
+            Key == TEXT("Lifetime") || Key == TEXT("ScaleRange") || Key == TEXT("SizeRange")
+            || Key == TEXT("SubImageSize") || Key == TEXT("FrameRange") ? 2 : 3;
 		if (!Json->TryGetArrayField(Key, Values) || Values->Num() != Expected)
 		{
 			OutError = FString(TEXT("Wrong vector size: ")) + Key; return false;
@@ -184,13 +201,29 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 		}
 	}
 	const auto& Lifetime = Json->GetArrayField(TEXT("Lifetime"));
-	const auto& Scale = Json->GetArrayField(TEXT("ScaleRange"));
+	const auto& Scale = Json->GetArrayField(bSmoke ? TEXT("SizeRange") : TEXT("ScaleRange"));
 	if (Lifetime[0]->AsNumber() <= 0 || Lifetime[1]->AsNumber() < Lifetime[0]->AsNumber()
 		|| Scale[0]->AsNumber() <= 0 || Scale[1]->AsNumber() < Scale[0]->AsNumber()
 		|| FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent")).GetMin() <= 0)
 	{
 		OutError = TEXT("Invalid lifetime, scale range or spawn half extent."); return false;
 	}
+    if (bSmoke)
+    {
+        const auto& Grid = Json->GetArrayField(TEXT("SubImageSize"));
+        const auto& Frames = Json->GetArrayField(TEXT("FrameRange"));
+        if (Json->GetNumberField(TEXT("Opacity")) > 1 || Json->GetNumberField(TEXT("RiseSpeed")) <= 0
+            || Grid[0]->AsNumber() < 1 || Grid[1]->AsNumber() < 1
+            || Grid[0]->AsNumber() > 64 || Grid[1]->AsNumber() > 64
+            || Grid[0]->AsNumber() != FMath::FloorToDouble(Grid[0]->AsNumber())
+            || Grid[1]->AsNumber() != FMath::FloorToDouble(Grid[1]->AsNumber())
+            || Frames[0]->AsNumber() < 0 || Frames[1]->AsNumber() < Frames[0]->AsNumber()
+            || Frames[1]->AsNumber() >= Grid[0]->AsNumber() * Grid[1]->AsNumber())
+        { OutError = TEXT("Invalid smoke opacity, speed, atlas grid or frame range."); return false; }
+        for (const auto& Channel : Json->GetArrayField(TEXT("Color")))
+            if (Channel->AsNumber() < 0 || Channel->AsNumber() > 1)
+            { OutError = TEXT("Smoke linear RGBA must be within 0..1."); return false; }
+    }
 	const FVector Minimum = FLeafNiagaraBuilder::Vector(Json, TEXT("FixedBoundsMin"));
 	const FVector Maximum = FLeafNiagaraBuilder::Vector(Json, TEXT("FixedBoundsMax"));
 	if ((Maximum - Minimum).GetMin() <= 0 || Json->GetNumberField(TEXT("MaxInstances")) != FMath::FloorToDouble(Json->GetNumberField(TEXT("MaxInstances"))))
@@ -203,18 +236,18 @@ bool UNiagaraJsonGenerator::ValidateJsonDefinition(const FString& Document, FStr
 	{
 		OutError = TEXT("Material and EffectType must be project assets."); return false;
 	}
-	// 固定包围盒必须覆盖最久存活粒子的全部轨迹及叶片尺寸，避免运动正常却提前裁剪。
+	// 固定包围盒覆盖最久寿命、风向、摆幅与最大粒子尺寸，避免预设生成后提前裁剪。
 	const FVector Extent = FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent"));
 	const FVector Wind = FLeafNiagaraBuilder::Vector(Json, TEXT("WindVelocity"));
 	const double Age = Lifetime[1]->AsNumber();
-	const double Margin = Json->GetNumberField(TEXT("SwayStrength")) + Scale[1]->AsNumber() * 10;
-	const FVector End(Wind.X * Age, Wind.Y * Age, -Json->GetNumberField(TEXT("FallSpeed")) * Age);
+	const double Margin = Json->GetNumberField(TEXT("SwayStrength")) * (bSmoke ? 2 : 1) + Scale[1]->AsNumber() * (bSmoke ? 1.2 : 10);
+	const FVector End(Wind.X * Age, Wind.Y * Age, (bSmoke ? Wind.Z + Json->GetNumberField(TEXT("RiseSpeed")) : -Json->GetNumberField(TEXT("FallSpeed"))) * Age);
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
 		if (Minimum[Axis] > -Extent[Axis] + FMath::Min(0.0, End[Axis]) - Margin
 			|| Maximum[Axis] < Extent[Axis] + FMath::Max(0.0, End[Axis]) + Margin)
 		{
-			OutError = TEXT("Fixed bounds do not cover the complete leaf trajectory."); return false;
+			OutError = TEXT("Fixed bounds do not cover the complete preset trajectory."); return false;
 		}
 	}
 	return true;
@@ -232,7 +265,7 @@ FString UNiagaraJsonGenerator::DescribeSystem(UNiagaraSystem* System)
 	Json->SetNumberField(TEXT("emitters"), System->GetEmitterHandles().Num());
 	Json->SetNumberField(TEXT("compiledEmitters"), System->GetEmitterCompiledData().Num());
 	Json->SetNumberField(TEXT("spawnInfoCount"), System->GetEmitterHandles().IsEmpty() ? 0 : System->GetEmitterSpawnInfoAccessors(0).Num());
-	int32 MeshCount = 0;
+	int32 MeshCount = 0, SpriteCount = 0;
 	bool bWorldSpace = true, bCpu = true, bUserMaterial = true;
 	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
 	{
@@ -242,13 +275,26 @@ FString UNiagaraJsonGenerator::DescribeSystem(UNiagaraSystem* System)
 		for (UNiagaraRendererProperties* Properties : Data->GetRenderers())
 		{
 			const UNiagaraMeshRendererProperties* Renderer = Cast<UNiagaraMeshRendererProperties>(Properties);
-			if (!Renderer) { bUserMaterial = false; continue; }
+			if (!Renderer)
+            {
+                const auto* Sprite = Cast<UNiagaraSpriteRendererProperties>(Properties);
+                if (Sprite)
+                {
+                    ++SpriteCount;
+                    bUserMaterial &= Sprite->MaterialUserParamBinding.Parameter.GetName() == TEXT("User.SmokeMaterial");
+                    Json->SetNumberField(TEXT("atlasColumns"), Sprite->SubImageSize.X);
+                    Json->SetNumberField(TEXT("atlasRows"), Sprite->SubImageSize.Y);
+                }
+                else bUserMaterial = false;
+                continue;
+            }
 			MeshCount += Renderer->Meshes.Num();
 			bUserMaterial &= Renderer->bOverrideMaterials && Renderer->OverrideMaterials.Num() == 1
 				&& Renderer->OverrideMaterials[0].UserParamBinding.Parameter.GetName() == TEXT("User.LeafMaterial");
 		}
 	}
 	Json->SetNumberField(TEXT("meshCount"), MeshCount);
+    Json->SetNumberField(TEXT("spriteCount"), SpriteCount);
 	Json->SetBoolField(TEXT("worldSpace"), bWorldSpace);
 	Json->SetBoolField(TEXT("cpu"), bCpu);
 	Json->SetBoolField(TEXT("userMaterial"), bUserMaterial);
@@ -278,13 +324,14 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	}
 	TSharedPtr<FJsonObject> Json;
 	FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Document), Json);
+    const bool bSmoke = Json->GetStringField(TEXT("Preset")) == TEXT("SmokeSprite");
 	if (FPaths::GetBaseFilename(OutputAssetPath) != Json->GetStringField(TEXT("Name"))
 		|| FPaths::GetPath(Json->GetStringField(TEXT("EffectTypePath"))) != FPaths::GetPath(OutputAssetPath)) return nullptr;
 	UNiagaraEmitter* Minimal = LoadObject<UNiagaraEmitter>(nullptr, TEXT("/Niagara/DefaultAssets/Templates/Emitters/Minimal.Minimal"));
 	UNiagaraScript* SpawnRate = LoadObject<UNiagaraScript>(nullptr, TEXT("/Niagara/Modules/Emitter/SpawnRate.SpawnRate"));
 	UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *Json->GetStringField(TEXT("DefaultMaterial")));
 	TArray<UStaticMesh*> Meshes;
-	for (const auto& Path : Json->GetArrayField(TEXT("Meshes")))
+	if (!bSmoke) for (const auto& Path : Json->GetArrayField(TEXT("Meshes")))
 	{
 		UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *Path->AsString());
 		if (!Mesh) return nullptr;
@@ -327,23 +374,51 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	const FNiagaraTypeDefinition Float = FNiagaraTypeDefinition::GetFloatDef();
 	const FNiagaraTypeDefinition Vec3 = FNiagaraTypeDefinition::GetVec3Def();
 	const auto& Lifetime = Json->GetArrayField(TEXT("Lifetime"));
-	const auto& Scale = Json->GetArrayField(TEXT("ScaleRange"));
+	const auto& Scale = Json->GetArrayField(bSmoke ? TEXT("SizeRange") : TEXT("ScaleRange"));
 	Builder.Parameter(Float, TEXT("User.SpawnRate"), float(Json->GetNumberField(TEXT("SpawnRate"))));
 	Builder.Parameter(FNiagaraTypeDefinition::GetVec2Def(), TEXT("User.Lifetime"), FVector2f(Lifetime[0]->AsNumber(), Lifetime[1]->AsNumber()));
-	Builder.Parameter(FNiagaraTypeDefinition::GetVec2Def(), TEXT("User.ScaleRange"), FVector2f(Scale[0]->AsNumber(), Scale[1]->AsNumber()));
+	Builder.Parameter(FNiagaraTypeDefinition::GetVec2Def(), bSmoke ? TEXT("User.SizeRange") : TEXT("User.ScaleRange"), FVector2f(Scale[0]->AsNumber(), Scale[1]->AsNumber()));
 	Builder.Parameter(Vec3, TEXT("User.SpawnHalfExtent"), FVector3f(FLeafNiagaraBuilder::Vector(Json, TEXT("SpawnHalfExtent"))));
 	Builder.Parameter(Vec3, TEXT("User.WindVelocity"), FVector3f(FLeafNiagaraBuilder::Vector(Json, TEXT("WindVelocity"))));
-	for (const TCHAR* Key : {TEXT("FallSpeed"), TEXT("SwayStrength"), TEXT("RotationRate")})
-	{
-		Builder.Parameter(Float, *(FString(TEXT("User.")) + Key), float(Json->GetNumberField(Key)));
-	}
-	const FNiagaraVariable MaterialVariable(FNiagaraTypeDefinition(UMaterialInterface::StaticClass()), TEXT("User.LeafMaterial"));
+    TArray<FString> MotionKeys = {TEXT("SwayStrength"), TEXT("RotationRate")};
+    if (bSmoke) MotionKeys.Append({TEXT("RiseSpeed"), TEXT("Opacity"), TEXT("FlipbookRate"), TEXT("Seed")});
+    else MotionKeys.Add(TEXT("FallSpeed"));
+    for (const FString& Key : MotionKeys)
+        Builder.Parameter(Float, *(TEXT("User.") + Key), float(Json->GetNumberField(Key)));
+    if (bSmoke)
+    {
+        const auto& Color = Json->GetArrayField(TEXT("Color"));
+        const auto& Frames = Json->GetArrayField(TEXT("FrameRange"));
+        Builder.Parameter(FNiagaraTypeDefinition::GetColorDef(), TEXT("User.Color"),
+            FLinearColor(Color[0]->AsNumber(), Color[1]->AsNumber(), Color[2]->AsNumber(), Color[3]->AsNumber()));
+        Builder.Parameter(FNiagaraTypeDefinition::GetVec2Def(), TEXT("User.FrameRange"), FVector2f(Frames[0]->AsNumber(), Frames[1]->AsNumber()));
+    }
+    const FNiagaraVariable MaterialVariable(FNiagaraTypeDefinition(UMaterialInterface::StaticClass()),
+        bSmoke ? TEXT("User.SmokeMaterial") : TEXT("User.LeafMaterial"));
 	Builder.System->GetExposedParameters().AddParameter(MaterialVariable);
 	Builder.System->GetExposedParameters().SetUObject(Material, MaterialVariable);
 	UNiagaraNodeFunctionCall* Rate = FNiagaraStackGraphUtilities::AddScriptModuleToStack(SpawnRate, *EmitterUpdate);
 	const FNiagaraParameterHandle RateHandle = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(FNiagaraParameterHandle(TEXT("Module.SpawnRate")), Rate);
 	UEdGraphPin& RatePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(*Rate, RateHandle, Float, FGuid(), FGuid());
 	FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(RatePin, FNiagaraVariable(Float, TEXT("User.SpawnRate")), {});
+    // 烟团为世界空间 Sprite；出口移动只影响新粒子，已出生烟团沿各自原点缓慢漂移。
+    if (bSmoke)
+    {
+        Builder.Assign(*Spawn, Vec3, TEXT("Particles.SmokeSeed"), TEXT("frac(sin(((float)Particles.UniqueID+User.Seed)*float3(12.9898,78.233,39.425)+Engine.Owner.Position*0.01+float3(0.137,0.37,0.72))*43758.5453)"));
+        Builder.Assign(*Spawn, Float, TEXT("Particles.Lifetime"), TEXT("max(0.1,lerp(User.Lifetime.x,User.Lifetime.y,Particles.SmokeSeed.x))"));
+        Builder.Assign(*Spawn, FNiagaraTypeDefinition::GetPositionDef(), TEXT("Particles.Position"), TEXT("Engine.Owner.Position+(Particles.SmokeSeed*2.0-1.0)*User.SpawnHalfExtent"));
+        Builder.Assign(*Spawn, FNiagaraTypeDefinition::GetPositionDef(), TEXT("Particles.SmokeOrigin"), TEXT("Particles.Position"));
+        Builder.Assign(*Update, FNiagaraTypeDefinition::GetPositionDef(), TEXT("Particles.Position"), TEXT("Particles.SmokeOrigin+float3(User.WindVelocity.xy,User.RiseSpeed+User.WindVelocity.z)*Particles.Age+float3(sin(Particles.Age*0.65+Particles.SmokeSeed.x*6.283)-sin(Particles.SmokeSeed.x*6.283),cos(Particles.Age*0.55+Particles.SmokeSeed.y*6.283)-cos(Particles.SmokeSeed.y*6.283),0.0)*User.SwayStrength"));
+        for (UNiagaraNodeOutput* Output : {Spawn, Update})
+        {
+            Builder.Assign(*Output, FNiagaraTypeDefinition::GetVec2Def(), TEXT("Particles.SpriteSize"), TEXT("float2(1.0,1.0)*max(0.1,lerp(User.SizeRange.x,User.SizeRange.y,saturate(Particles.Age/Particles.Lifetime)))*(0.8+0.4*Particles.SmokeSeed.z)"));
+            Builder.Assign(*Output, Float, TEXT("Particles.SpriteRotation"), TEXT("Particles.SmokeSeed.y*360.0+Particles.Age*User.RotationRate"));
+            Builder.Assign(*Output, Float, TEXT("Particles.SubImageIndex"), TEXT("clamp(User.FrameRange.x+Particles.Age*User.FlipbookRate,User.FrameRange.x,User.FrameRange.y)"));
+            Builder.Assign(*Output, FNiagaraTypeDefinition::GetColorDef(), TEXT("Particles.Color"), TEXT("User.Color*float4(1.0,1.0,1.0,User.Opacity*saturate(Particles.Age/0.65)*pow(saturate(1.0-Particles.Age/Particles.Lifetime),1.3))"));
+        }
+    }
+    else
+    {
 	// Niagara DynamicInput 自己生成输出赋值；这里仅提供表达式，不再嵌套语句块。
 	Builder.Assign(*Spawn, Vec3, TEXT("Particles.LeafSeed"), TEXT("frac(sin((float)Particles.UniqueID*float3(12.9898,78.233,39.425)+float3(0.137,0.37,0.72))*43758.5453)"));
 	Builder.Assign(*Spawn, Float, TEXT("Particles.Lifetime"), TEXT("lerp(User.Lifetime.x,User.Lifetime.y,Particles.LeafSeed.x)"));
@@ -359,8 +434,23 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 		Builder.Assign(*Output, Vec3, TEXT("Particles.Scale"), ScaleCode);
 		Builder.Assign(*Output, FNiagaraTypeDefinition::GetQuatDef(), TEXT("Particles.MeshOrientation"), RotationCode);
 	}
+    }
 	const auto OldRenderers = Data->GetRenderers();
 	for (UNiagaraRendererProperties* Renderer : OldRenderers) Builder.Emitter->RemoveRenderer(Renderer, Builder.Emitter->GetExposedVersion().VersionGuid);
+    if (bSmoke)
+    {
+        auto* Renderer = NewObject<UNiagaraSpriteRendererProperties>(Builder.Emitter);
+        Renderer->Material = Material;
+        Renderer->MaterialUserParamBinding.Parameter = MaterialVariable;
+        Renderer->FacingMode = ENiagaraSpriteFacingMode::FaceCamera;
+        Renderer->Alignment = ENiagaraSpriteAlignment::Unaligned;
+        const auto& Grid = Json->GetArrayField(TEXT("SubImageSize"));
+        Renderer->SubImageSize = FVector2D(Grid[0]->AsNumber(), Grid[1]->AsNumber());
+        Renderer->bSubImageBlend = true;
+        Builder.Emitter->AddRenderer(Renderer, Builder.Emitter->GetExposedVersion().VersionGuid);
+    }
+    else
+    {
 	UNiagaraMeshRendererProperties* Renderer = NewObject<UNiagaraMeshRendererProperties>(Builder.Emitter);
 	Renderer->Meshes.Reset();
 	for (UStaticMesh* Mesh : Meshes) { FNiagaraMeshRendererMeshProperties Entry; Entry.Mesh = Mesh; Renderer->Meshes.Add(Entry); }
@@ -370,6 +460,7 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	Override.UserParamBinding.Parameter = MaterialVariable;
 	Renderer->OverrideMaterials.Add(Override);
 	Builder.Emitter->AddRenderer(Renderer, Builder.Emitter->GetExposedVersion().VersionGuid);
+    }
 	const FBox Bounds(FLeafNiagaraBuilder::Vector(Json, TEXT("FixedBoundsMin")), FLeafNiagaraBuilder::Vector(Json, TEXT("FixedBoundsMax")));
 	Data->FixedBounds = Bounds;
 	Builder.System->bFixedBounds = true;
@@ -407,7 +498,13 @@ UNiagaraSystem* UNiagaraJsonGenerator::GenerateFromJson(const FString& JsonPath,
 	if (!Builder.System->IsValid() || !Builder.System->IsReadyToRun()
 		|| Builder.System->GetEmitterCompiledData().Num() != 1 || Builder.System->GetEmitterSpawnInfoAccessors(0).IsEmpty())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("Niagara JSON compile failed: %s"), *OutputAssetPath); return nullptr;
+		UE_LOG(LogTemp, Warning, TEXT("Niagara JSON compile failed: %s; %s"), *OutputAssetPath,
+            *DescribeSystem(Builder.System));
+        for (UNiagaraScript* Script : {Builder.System->GetSystemSpawnScript(), Builder.System->GetSystemUpdateScript(),
+            Data->SpawnScriptProps.Script.Get(), Data->UpdateScriptProps.Script.Get()})
+            UE_LOG(LogTemp, Warning, TEXT("Niagara script %s status=%d: %s"), *Script->GetName(),
+                int32(Script->GetLastCompileStatus()), *Script->GetVMExecutableData().ErrorMsg);
+        return nullptr;
 	}
 	if (!FLeafNiagaraBuilder::Save(Effect) || !FLeafNiagaraBuilder::Save(Builder.System)) return nullptr;
 	UE_LOG(LogTemp, Display, TEXT("Niagara JSON generated and compiled: %s"), *OutputAssetPath);
