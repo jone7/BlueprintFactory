@@ -83,6 +83,13 @@ namespace
 		FName StateName;
 		FString AnimationAssetPath;
 		FVector2f NodePosition = FVector2f::ZeroVector;
+        // 同一个状态播放器的显式播放配置，子蓝图仅替换动画资产。
+        bool bLoopAnimation = true;
+        float PlayRate = 1.f;
+        float StartPosition = 0.f;
+        // 可绑定共享 AnimBP 变量；空名称代表使用该状态的常量。
+        FName PlayRateVariable;
+        FName StartPositionVariable;
 	};
 
 	struct FAnimStateMachineTransitionSpec
@@ -594,6 +601,7 @@ namespace
 		return false;
 	}
 
+	// 解析共享状态、条件及播放器参数，非法时间/速率在生成前拒绝。
 	bool ParseStateMachineDefinitionJson(const FString& DefinitionJson, FAnimStateMachineDefinition& OutDefinition)
 	{
 		if (DefinitionJson.IsEmpty())
@@ -685,6 +693,15 @@ namespace
 				FAnimStateMachineStateSpec StateSpec;
 				StateSpec.StateName = FName(*Name);
 				StateObject->TryGetStringField(TEXT("AnimationAsset"), StateSpec.AnimationAssetPath);
+                StateObject->TryGetBoolField(TEXT("LoopAnimation"), StateSpec.bLoopAnimation);
+                double PlayRate=1., StartPosition=0.;
+                StateObject->TryGetNumberField(TEXT("PlayRate"), PlayRate);
+                StateObject->TryGetNumberField(TEXT("StartPosition"), StartPosition);
+                if (!FMath::IsFinite(PlayRate) || !FMath::IsFinite(StartPosition) || PlayRate<0 || StartPosition<0) return false;
+                StateSpec.PlayRate=static_cast<float>(PlayRate); StateSpec.StartPosition=static_cast<float>(StartPosition);
+                FString Variable;
+                if (StateObject->TryGetStringField(TEXT("PlayRateVariable"), Variable)) StateSpec.PlayRateVariable=FName(*Variable);
+                if (StateObject->TryGetStringField(TEXT("StartPositionVariable"), Variable)) StateSpec.StartPositionVariable=FName(*Variable);
 				TryReadVector2f(StateObject, TEXT("NodePosition"), StateSpec.NodePosition);
 				OutDefinition.States.Add(StateSpec);
 			}
@@ -1604,6 +1621,7 @@ namespace
 		return nullptr;
 	}
 
+	// 状态只建立一个播放器；播放速率和起点绑定复用既有公共绑定入口。
 	UAnimStateNode* CreateStateNode(UBlueprint* Blueprint, UEdGraph* StateMachineGraph, const FAnimStateMachineStateSpec& Spec)
 	{
 		if (!Blueprint || !StateMachineGraph)
@@ -1647,6 +1665,13 @@ namespace
 				PlayerNode->SetAnimationAsset(AnimationAsset);
 			}
 
+            // UE 5.8 的速率/起点 setter 只写运行时折叠数据；编辑器生成必须写反射默认属性。
+            FindFProperty<FBoolProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("bLoopAnimation"))->SetPropertyValue_InContainer(&PlayerNode->Node, Spec.bLoopAnimation);
+            FindFProperty<FFloatProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("PlayRate"))->SetPropertyValue_InContainer(&PlayerNode->Node, Spec.PlayRate);
+            FindFProperty<FFloatProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("StartPosition"))->SetPropertyValue_InContainer(&PlayerNode->Node, Spec.StartPosition);
+            if ((!Spec.PlayRateVariable.IsNone() && !BindAnimGraphNodePinToBlueprintVariable(PlayerNode, TEXT("PlayRate"), Spec.PlayRateVariable))
+                || (!Spec.StartPositionVariable.IsNone() && !BindAnimGraphNodePinToBlueprintVariable(PlayerNode, TEXT("StartPosition"), Spec.StartPositionVariable)))
+                return nullptr;
 			if (UEdGraphPin* PlayerOutput = FindFirstPin(PlayerNode, EGPD_Output))
 			{
 				StateNode->BoundGraph->GetSchema()->TryCreateConnection(PlayerOutput, PosePin);
@@ -2299,6 +2324,21 @@ namespace
 		return FString();
 	}
 
+    // 回读与生成共用同一属性绑定结构，确保导出再生成不会丢失播放参数。
+    FName ExportStatePlayerBinding(UAnimGraphNode_Base* Node, FName PinName)
+    {
+        UObject* BindingObject=reinterpret_cast<UObject*>(Node->GetMutableBinding());
+        if (!BindingObject) return NAME_None;
+        auto* Property=FindFProperty<FMapProperty>(BindingObject->GetClass(), TEXT("PropertyBindings"));
+        if (!Property) return NAME_None;
+        FScriptMapHelper Map(Property, Property->ContainerPtrToValuePtr<void>(BindingObject));
+        const int32 Index=Map.FindMapIndexWithKey(&PinName);
+        if (Index==INDEX_NONE) return NAME_None;
+        const auto* Binding=reinterpret_cast<const FAnimGraphNodePropertyBinding*>(Map.GetValuePtr(Index));
+        return Binding->bIsBound && Binding->PropertyPath.Num()==1 ? FName(*Binding->PropertyPath[0]) : NAME_None;
+    }
+
+    // 导出共享状态及其播放器参数，保留子蓝图资产覆盖的稳定状态名。
 	TSharedPtr<FJsonObject> BuildStateMachineDefinitionObject(UAnimBlueprint* AnimBlueprint)
 	{
 		UEdGraph* AnimGraph = FindAnimGraph(AnimBlueprint);
@@ -2360,6 +2400,14 @@ namespace
 			if (UAnimGraphNode_SequencePlayer* SequencePlayer = FindSequencePlayerNode(StateNode->BoundGraph))
 			{
 				StateObject->SetStringField(TEXT("AnimationAsset"), GetAnimationAssetPath(SequencePlayer->GetAnimationAsset()));
+                StateObject->SetBoolField(TEXT("LoopAnimation"), FindFProperty<FBoolProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("bLoopAnimation"))->GetPropertyValue_InContainer(&SequencePlayer->Node));
+                StateObject->SetNumberField(TEXT("PlayRate"), FindFProperty<FFloatProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("PlayRate"))->GetPropertyValue_InContainer(&SequencePlayer->Node));
+                StateObject->SetNumberField(TEXT("StartPosition"), FindFProperty<FFloatProperty>(FAnimNode_SequencePlayer::StaticStruct(), TEXT("StartPosition"))->GetPropertyValue_InContainer(&SequencePlayer->Node));
+                for (const FName Pin : {FName(TEXT("PlayRate")), FName(TEXT("StartPosition"))})
+                {
+                    const FName Variable=ExportStatePlayerBinding(SequencePlayer, Pin);
+                    if (!Variable.IsNone()) StateObject->SetStringField(Pin.ToString()+TEXT("Variable"), Variable.ToString());
+                }
 			}
 			StateValues.Add(MakeShared<FJsonValueObject>(StateObject));
 		}
