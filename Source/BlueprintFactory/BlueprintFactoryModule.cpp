@@ -312,6 +312,7 @@ FString BuildExportPythonCommand(const FString& GenerationType, const FString& A
 }
 }
 
+/** 注册编辑器工具与作者保存回写；Cook 的平台保存不触发反向导出。 */
 void FBlueprintFactoryModule::StartupModule()
 {
 	FGlobalTabmanager::Get()->RegisterNomadTabSpawner(TabId,
@@ -322,8 +323,14 @@ void FBlueprintFactoryModule::StartupModule()
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FBlueprintFactoryModule::RegisterMenus));
 
 	PackageSavedHandle = UPackage::PackageSavedWithContextEvent.AddLambda(
-		[](const FString&, UPackage* SavedPackage, FObjectPostSaveContext)
+		[](const FString&, UPackage* SavedPackage, FObjectPostSaveContext SaveContext)
 		{
+			// Cook 只生成目标平台数据，不能回写作者 JSON 或调用编辑器 Python。
+			if (SaveContext.IsCooking())
+			{
+				return;
+			}
+
 			if (!SavedPackage)
 			{
 				return;
